@@ -1,0 +1,216 @@
+// The Stripe API as it comes BACK. Stripe takes form-encoded requests and answers JSON, so only this direction is
+// deserialized — the request side is `FormBody`.
+//
+// ⚠ EVERY `id` IS `[ExternalName("id")]` ON A MEMBER CALLED SOMETHING ELSE. A materialized class gets an implicit
+//   `Id`, so a member literally named `Id` collides with it; the wire mapping is what keeps the JSON honest. (The
+//   same shape `Osysharp.Resend` and `demo/auth-demo` each had to discover by hand.)
+namespace Osysharp.Payments.Stripe;
+
+/// A PaymentIntent — Stripe's record of one attempt to collect one amount.
+///
+/// ⭐ `Status` IS THE BUSINESS OUTCOME, and reading it is not optional. A declined card is usually a 200 response
+///    carrying `requires_payment_method`, NOT an HTTP error — so a caller that only checks for an exception has
+///    written a payment flow that treats a decline as a success. The statuses worth branching on:
+///    `succeeded` · `requires_payment_method` (declined — ask for another card) · `requires_action` (3-D Secure:
+///    send the customer to `ClientSecret`) · `requires_capture` (authorized, awaiting `Capture`) · `canceled`.
+public class StripePaymentIntent {
+  [ExternalName("id")] public string? IntentId;
+  [ExternalName("status")] public string? Status;
+  /// Minor units — 2000 is 20.00. See `FormBody.AddLong`.
+  [ExternalName("amount")] public long Amount;
+  [ExternalName("amount_received")] public long AmountReceived;
+  [ExternalName("currency")] public string? Currency;
+  /// What the BROWSER needs to confirm a card, and the only field here that is meant to leave the server. It is
+  /// scoped to this one intent and is not a credential for anything else — which is why handing it to the client is
+  /// the designed flow rather than a leak.
+  [ExternalName("client_secret")] public string? ClientSecret;
+  [ExternalName("customer")] public string? Customer;
+  [ExternalName("latest_charge")] public string? LatestCharge;
+  /// The `pm_…` it was paid with — with `Customer`, what a later charge without the customer takes.
+  [ExternalName("payment_method")] public string? PaymentMethod;
+  /// `off_session` when the way to pay was kept for later.
+  [ExternalName("setup_future_usage")] public string? SetupFutureUsage;
+  /// Why the last attempt failed — a decline, or the bank asking the customer to confirm it themselves.
+  [ExternalName("last_payment_error")] public StripeError? LastPaymentError;
+  /// The app's own keys on it — what a payment taken at a counter is checked against (`reference`).
+  [ExternalName("metadata")] public Dictionary<string, string>? Metadata;
+}
+
+/// A Stripe Terminal reader (`tmr_…`) as the API answers it — its state, and the last thing it was asked to do.
+public class StripeReader {
+  [ExternalName("id")] public string? ReaderId;
+  /// `online` or `offline`.
+  [ExternalName("status")] public string? Status;
+  [ExternalName("action")] public StripeReaderAction? Action;
+}
+
+/// What a reader was last asked to do, and how that stands.
+public class StripeReaderAction {
+  /// `process_payment_intent`, …
+  [ExternalName("type")] public string? Type;
+  /// `in_progress`, `succeeded` or `failed`.
+  [ExternalName("status")] public string? Status;
+  [ExternalName("failure_code")] public string? FailureCode;
+  [ExternalName("failure_message")] public string? FailureMessage;
+  [ExternalName("process_payment_intent")] public StripeReaderPaymentAction? ProcessPaymentIntent;
+}
+
+public class StripeReaderPaymentAction {
+  [ExternalName("payment_intent")] public string? PaymentIntent;
+}
+
+/// A way to pay kept on a customer. Only the card's brand and last four are here — enough to name it.
+public class StripePaymentMethod {
+  [ExternalName("id")] public string? MethodId;
+  [ExternalName("type")] public string? Type;
+  [ExternalName("card")] public StripeCard? Card;
+}
+
+public class StripeCard {
+  /// `visa` · `mastercard` · `amex` …
+  [ExternalName("brand")] public string? Brand;
+  [ExternalName("last4")] public string? Last4;
+}
+
+/// A Checkout Session — the hosted payment page, and the shortest path to taking money.
+///
+/// ⚑ REACH FOR THIS BEFORE PaymentIntent. Checkout is a URL you redirect to; Stripe hosts the form, handles 3-D
+///   Secure, Apple Pay, Klarna and the PCI surface, and sends the customer back. A PaymentIntent is the right answer
+///   when you are building your own card form and have decided to own that.
+public class StripeCheckoutSession {
+  [ExternalName("id")] public string? SessionId;
+  /// Where to send the customer. A session is useless without it, and it expires — create one per attempt.
+  [ExternalName("url")] public string? Url;
+  /// `open` · `complete` · `expired`.
+  [ExternalName("status")] public string? Status;
+  /// `unpaid` · `paid` · `no_payment_required`. ⚠ THIS, not `status`, is what says you were paid.
+  [ExternalName("payment_status")] public string? PaymentStatus;
+  [ExternalName("payment_intent")] public string? PaymentIntent;
+  [ExternalName("amount_total")] public long AmountTotal;
+  [ExternalName("currency")] public string? Currency;
+  /// The `ClientReferenceId` the session was created with — your order, as Stripe reports it back.
+  [ExternalName("client_reference_id")] public string? ClientReferenceId;
+  /// The `cus_…` the session paid as — made by the session when it kept the way to pay.
+  [ExternalName("customer")] public string? Customer;
+}
+
+/// A customer, so a second payment does not ask for the card again.
+/// A payout to the account's bank. `ArrivalDate` is Unix seconds.
+public class StripePayout {
+  [ExternalName("id")] public string? PayoutId;
+  [ExternalName("amount")] public long Amount;
+  [ExternalName("arrival_date")] public long ArrivalDate;
+  [ExternalName("currency")] public string? Currency;
+  [ExternalName("status")] public string? Status;
+}
+
+public class StripePayoutList {
+  [ExternalName("data")] public List<StripePayout> Data = [];
+  [ExternalName("has_more")] public bool HasMore;
+}
+
+/// What a balance transaction came from — expanded, so a charge or a refund names its payment intent.
+public class StripeBalanceSource {
+  [ExternalName("id")] public string? Id;
+  [ExternalName("payment_intent")] public string? PaymentIntent;
+}
+
+/// One movement of the balance a payout settles: a charge, a refund, a fee — with the fee Stripe took on it.
+public class StripeBalanceTransaction {
+  [ExternalName("id")] public string? TransactionId;
+  [ExternalName("amount")] public long Amount;
+  [ExternalName("fee")] public long Fee;
+  [ExternalName("net")] public long Net;
+  /// Set when Stripe converted the payment into the balance's currency: `amount` = the payment's amount × this.
+  [ExternalName("exchange_rate")] public decimal? ExchangeRate;
+  /// `charge`, `payment`, `refund`, `payment_refund`, `stripe_fee`, `payout`, `adjustment`…
+  [ExternalName("type")] public string? Type;
+  [ExternalName("source")] public StripeBalanceSource? Source;
+}
+
+public class StripeBalanceTransactionList {
+  [ExternalName("data")] public List<StripeBalanceTransaction> Data = [];
+  [ExternalName("has_more")] public bool HasMore;
+}
+
+/// A coupon — here always a one-off amount taken off one checkout session.
+public class StripeCoupon {
+  [ExternalName("id")] public string? CouponId;
+  [ExternalName("amount_off")] public long? AmountOff;
+}
+
+public class StripeCustomer {
+  [ExternalName("id")] public string? CustomerId;
+  [ExternalName("email")] public string? Email;
+  [ExternalName("name")] public string? Name;
+}
+
+/// A refund. `Status` is `succeeded` · `pending` · `failed` · `canceled` — and `pending` is normal for several
+/// payment methods, so a flow that treats anything but `succeeded` as a failure will report false alarms.
+public class StripeRefund {
+  [ExternalName("id")] public string? RefundId;
+  [ExternalName("status")] public string? Status;
+  [ExternalName("amount")] public long Amount;
+  [ExternalName("currency")] public string? Currency;
+  [ExternalName("payment_intent")] public string? PaymentIntent;
+}
+
+/// What Stripe says when it refuses, and it says a great deal — `type` classifies the fault, `code` names it,
+/// `decline_code` is the ISSUER's reason, and `param` names the field. A failure message that quotes all four sends
+/// the reader to the right place; a status code alone sends them to a status-code table.
+public class StripeError {
+  [ExternalName("type")] public string? Type;
+  [ExternalName("code")] public string? Code;
+  [ExternalName("decline_code")] public string? DeclineCode;
+  [ExternalName("message")] public string? Message;
+  [ExternalName("param")] public string? Param;
+  /// The failed request in YOUR Stripe dashboard — the fastest way to see what Stripe saw.
+  [ExternalName("request_log_url")] public string? RequestLogUrl;
+}
+
+/// The envelope every Stripe error arrives in.
+public class StripeErrorEnvelope {
+  [ExternalName("error")] public StripeError? Error;
+}
+
+/// The COMMON fields of a webhook event's `data.object`, whatever kind of object it is.
+///
+/// ⚠ IT IS A SUBSET AND SAYS SO. `data.object` is a PaymentIntent for `payment_intent.*`, a Checkout Session for
+///   `checkout.session.*`, an Invoice for `invoice.*` — one class cannot be all of them, and pretending otherwise
+///   would put fields on it that are null for most events with nothing saying why. These are the fields those kinds
+///   genuinely share. For anything else, `StripeVerifiedEvent.Payload` is the verified raw JSON: deserialize it into
+///   a class of your own, which is ordinary Osy# and needs nothing from this kit.
+public class StripeEventObject {
+  [ExternalName("id")] public string? ObjectId;
+  /// What kind of thing this is — `payment_intent`, `checkout.session`, `charge`, `invoice`.
+  [ExternalName("object")] public string? ObjectType;
+  [ExternalName("status")] public string? Status;
+  [ExternalName("payment_status")] public string? PaymentStatus;
+  [ExternalName("amount")] public long Amount;
+  [ExternalName("amount_total")] public long AmountTotal;
+  [ExternalName("currency")] public string? Currency;
+  [ExternalName("payment_intent")] public string? PaymentIntent;
+  [ExternalName("customer")] public string? Customer;
+  /// On a checkout-session event: the session's `ClientReferenceId` — which of YOUR orders it paid for.
+  [ExternalName("client_reference_id")] public string? ClientReferenceId;
+  /// Your own keys, as you set them — on a payment intent charged without the customer, `reference`.
+  [ExternalName("metadata")] public Dictionary<string, string>? Metadata;
+}
+
+/// The `data` wrapper Stripe puts every event object inside.
+public class StripeEventData {
+  [ExternalName("object")] public StripeEventObject? Object;
+}
+
+/// One webhook event, as Stripe sends it.
+public class StripeEventEnvelope {
+  [ExternalName("id")] public string? EventId;
+  /// `payment_intent.succeeded`, `checkout.session.completed`, … — the whole reason you are reading this.
+  [ExternalName("type")] public string? Type;
+  /// When Stripe created it, as unix seconds.
+  [ExternalName("created")] public long Created;
+  /// ⛔ FALSE IN TEST MODE. A handler that fulfils an order without checking this can be driven by anyone holding a
+  ///    test key for your account — which is every developer who has ever run the app locally.
+  [ExternalName("livemode")] public bool Livemode;
+  [ExternalName("data")] public StripeEventData? Data;
+}

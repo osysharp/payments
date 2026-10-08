@@ -1,0 +1,189 @@
+namespace StripeKitTests;
+
+using Osysharp.Http;
+using Osysharp.Payments;
+using Osysharp.Payments.Stripe;
+
+// StripePayments under the payments contract — every Stripe call stubbed.
+
+PaymentRequest Order(string reference, long amount) {
+  return new PaymentRequest { Reference = reference, Currency = "EUR", Amount = amount, Description = "Shop — order " + reference,
+                              ReturnUrl = "https://shop.test/paid/" + reference + "/stripe-{token}", CancelUrl = "https://shop.test/bag",
+                              IdempotencyKey = "o-1" };
+}
+
+[Test]
+void starting_opens_a_checkout_session_for_this_reference_that_returns_with_the_session_id() {
+  var posted = new List<string>();
+  Http.Post.Stub((url, body) => {
+    posted.Add(body);
+    return new HttpResponse { StatusCode = 200, Body = "{\"id\":\"cs_7\",\"url\":\"https://checkout.stripe.com/c/pay/cs_7\"}" };
+  });
+  var start = new StripePayments { ApiKey = "sk_test_x", WebhookSecret = "whsec_x" }.Start(Order("RC-1", 19000));
+  Assert.Equal("https://checkout.stripe.com/c/pay/cs_7", start.RedirectUrl);
+  Assert.Contains("client_reference_id=RC-1", posted[0]);
+  Assert.Contains("unit_amount%5D=19000", posted[0]);
+  Assert.Contains("stripe-%7BCHECKOUT_SESSION_ID%7D", posted[0]);
+}
+
+[Test]
+void a_discount_goes_on_as_one_coupon_since_a_checkout_line_cannot_be_negative() {
+  var urls = new List<string>();
+  var posted = new List<string>();
+  Http.Post.Stub((url, body) => {
+    urls.Add(url); posted.Add(body);
+    return url.EndsWith("/v1/coupons")
+      ? new HttpResponse { StatusCode = 200, Body = "{\"id\":\"co_1\",\"amount_off\":2400}" }
+      : new HttpResponse { StatusCode = 200, Body = "{\"id\":\"cs_8\",\"url\":\"https://checkout.stripe.com/c/pay/cs_8\"}" };
+  });
+  new StripePayments { ApiKey = "sk_test_x", WebhookSecret = "whsec_x" }.Start(new PaymentRequest {
+    Reference = "RC-2", Currency = "EUR", Amount = 21600, Description = "Shop — order RC-2", IdempotencyKey = "o-2",
+    ReturnUrl = "https://shop.test/paid/RC-2/stripe-{token}", CancelUrl = "https://shop.test/bag",
+    Lines = [new PaymentLine { Name = "Loafer", Quantity = 2, UnitPrice = 12000 },
+             new PaymentLine { Name = "PROMO10 10% off", UnitPrice = -2400 }],
+  });
+  Assert.Equal("https://api.stripe.com/v1/coupons", urls[0]);
+  Assert.Contains("amount_off=2400", posted[0]);
+  Assert.Contains("duration=once", posted[0]);
+  Assert.Contains("discounts%5B0%5D%5Bcoupon%5D=co_1", posted[1]);
+  Assert.DoesNotContain("-2400", posted[1]);                   // no negative line reaches the session
+}
+
+[Test]
+void a_session_for_another_reference_or_amount_is_not_a_payment_for_this_one() {
+  Http.Get.Stub((url, headers) => new HttpResponse { StatusCode = 200,
+    Body = "{\"id\":\"cs_7\",\"payment_status\":\"paid\",\"amount_total\":19000,\"client_reference_id\":\"RC-1\",\"payment_intent\":\"pi_7\"}" });
+  var stripe = new StripePayments { ApiKey = "sk_test_x", WebhookSecret = "whsec_x" };
+  var mine = stripe.Check("RC-1", 19000, "cs_7");
+  Assert.Equal(PaymentState.Paid, mine.State);
+  Assert.Equal("pi_7", mine.ProviderRef);
+  Assert.Equal(PaymentState.NotPaid, stripe.Check("RC-2", 19000, "cs_7").State);   // somebody else's session
+  Assert.Equal(PaymentState.NotPaid, stripe.Check("RC-1", 99000, "cs_7").State);   // a cheaper basket
+}
+
+[Test]
+void a_signed_completed_event_reads_as_paid_and_a_forged_one_is_refused() {
+  var payload = "{\"id\":\"evt_1\",\"type\":\"checkout.session.completed\",\"created\":1,\"livemode\":false,"
+    + "\"data\":{\"object\":{\"id\":\"cs_7\",\"object\":\"checkout.session\",\"payment_status\":\"paid\",\"amount_total\":19000,"
+    + "\"payment_intent\":\"pi_7\",\"client_reference_id\":\"RC-1\"}}}";
+  var stripe = new StripePayments { ApiKey = "sk_test_x", WebhookSecret = "whsec_x" };
+  var headers = new Dictionary<string, string>();
+  headers.Add("Stripe-Signature", SignatureFor("whsec_x", payload, NowSeconds()));
+  var e = stripe.HandleEvent(payload, headers)[0];
+  Assert.Equal(PaymentEventKind.Paid, e.Kind);
+  Assert.Equal("RC-1", e.Reference);
+  Assert.Equal("pi_7", e.ProviderRef);
+  Assert.Equal(19000, e.Amount);
+
+  var forged = new Dictionary<string, string>();
+  forged.Add("Stripe-Signature", SignatureFor("whsec_guess", payload, NowSeconds()));
+  Assert.Throws<Exception>(() => stripe.HandleEvent(payload, forged));
+}
+
+[Test]
+void a_refund_is_keyed_so_a_retry_refunds_once() {
+  var keys = new List<string>();
+  Http.Post.Stub((url, body, headers) => {
+    keys.Add(headers.ContainsKey("Idempotency-Key") ? headers["Idempotency-Key"] : "");
+    return new HttpResponse { StatusCode = 200, Body = "{\"id\":\"re_1\",\"status\":\"succeeded\",\"payment_intent\":\"pi_7\"}" };
+  });
+  var refund = new StripePayments { ApiKey = "sk_test_x", WebhookSecret = "whsec_x" }.Refund("pi_7", 0, "Returned", "o-1");
+  Assert.Equal(RefundState.Succeeded, refund.State);
+  Assert.Equal("re_1", refund.RefundRef);
+  Assert.Equal("refund-o-1", keys[0]);
+}
+
+[Test]
+void a_payout_names_the_payments_it_settles_and_the_fees_stripe_kept() {
+  Http.Get.Stub((url, headers) => url.Contains("/v1/payouts")
+    ? new HttpResponse { StatusCode = 200, Body = "{\"data\":[{\"id\":\"po_1\",\"amount\":11650,\"arrival_date\":1790000000,\"currency\":\"eur\",\"status\":\"paid\"}],\"has_more\":false}" }
+    : new HttpResponse { StatusCode = 200, Body = "{\"data\":["
+        + "{\"id\":\"txn_1\",\"amount\":12000,\"fee\":350,\"net\":11650,\"type\":\"charge\",\"source\":{\"id\":\"ch_1\",\"payment_intent\":\"pi_7\"}},"
+        + "{\"id\":\"txn_2\",\"amount\":-11650,\"fee\":0,\"net\":-11650,\"type\":\"payout\",\"source\":{\"id\":\"po_1\"}}],\"has_more\":false}" });
+  var payouts = new StripePayments { ApiKey = "sk_test_x", WebhookSecret = "whsec_x" }.Payouts(new DateTime(2026, 9, 1), new DateTime(2026, 9, 30));
+  var payout = payouts.Single();
+  Assert.Equal("po_1", payout.Id);
+  Assert.Equal(11650, payout.Net);
+  Assert.Equal(350, payout.Fees);
+  Assert.Equal("EUR", payout.Currency);
+  var line = payout.Lines.Single();                               // the payout's own row is not a payment
+  Assert.Equal("pi_7", line.ProviderRef);
+  Assert.Equal("sale", line.Kind);
+  Assert.Equal(12000, line.Amount);
+}
+
+// ── a kept card: saved at checkout, charged later without the customer ──────────────────────────────────────────
+
+[Test]
+void asking_to_keep_the_card_makes_a_customer_and_saves_it_for_charges_without_them() {
+  var posted = new List<string>();
+  Http.Post.Stub((url, body) => { posted.Add(body);
+    return new HttpResponse { StatusCode = 200, Body = "{\"id\":\"cs_9\",\"url\":\"https://checkout.stripe.com/c/pay/cs_9\"}" }; });
+  var request = Order("RC-9", 10000);
+  request.SaveMethod = true;
+  new StripePayments { ApiKey = "sk_test_x", WebhookSecret = "whsec_x" }.Start(request);
+  Assert.Contains("payment_intent_data%5Bsetup_future_usage%5D=off_session", posted[0]);
+  Assert.Contains("customer_creation=always", posted[0]);
+  var plain = new List<string>();
+  Http.Post.Stub((url, body) => { plain.Add(body);
+    return new HttpResponse { StatusCode = 200, Body = "{\"id\":\"cs_1\",\"url\":\"https://checkout.stripe.com/c/pay/cs_1\"}" }; });
+  new StripePayments { ApiKey = "sk_test_x", WebhookSecret = "whsec_x" }.Start(Order("RC-1", 10000));
+  Assert.DoesNotContain("setup_future_usage", plain[0]);          // nothing kept unless asked
+}
+
+[Test]
+void the_return_page_answers_the_kept_card_by_its_brand_and_last_four() {
+  Http.Get.Stub((url, headers) => new HttpResponse { StatusCode = 200, Body =
+      url.Contains("/checkout/sessions/") ? "{\"id\":\"cs_9\",\"payment_status\":\"paid\",\"amount_total\":10000,\"client_reference_id\":\"RC-9\",\"payment_intent\":\"pi_9\",\"customer\":\"cus_9\"}"
+    : url.Contains("/payment_intents/") ? "{\"id\":\"pi_9\",\"status\":\"succeeded\",\"customer\":\"cus_9\",\"payment_method\":\"pm_9\",\"setup_future_usage\":\"off_session\"}"
+    : "{\"id\":\"pm_9\",\"type\":\"card\",\"card\":{\"brand\":\"visa\",\"last4\":\"4242\"}}" });
+  var check = new StripePayments { ApiKey = "sk_test_x", WebhookSecret = "whsec_x" }.Check("RC-9", 10000, "cs_9");
+  Assert.Equal(PaymentState.Paid, check.State);
+  Assert.Equal("cus_9/pm_9", check.SavedMethod);
+  Assert.Equal("Visa •••• 4242", check.SavedMethodLabel);
+}
+
+[Test]
+void a_kept_card_is_charged_off_session_for_this_reference_and_a_decline_is_an_answer_not_an_error() {
+  var posted = new List<string>();
+  Http.Post.Stub((url, body) => { posted.Add(body);
+    return new HttpResponse { StatusCode = 200, Body = "{\"id\":\"pi_r1\",\"status\":\"succeeded\",\"amount\":10000}" }; });
+  var stripe = new StripePayments { ApiKey = "sk_test_x", WebhookSecret = "whsec_x" };
+  var paid = stripe.ChargeSaved("cus_9/pm_9", Order("RC-10", 10000));
+  Assert.Equal(PaymentState.Paid, paid.State);
+  Assert.Equal("pi_r1", paid.ProviderRef);
+  Assert.Contains("customer=cus_9", posted[0]);
+  Assert.Contains("payment_method=pm_9", posted[0]);
+  Assert.Contains("off_session=true", posted[0]);
+  Assert.Contains("confirm=true", posted[0]);
+  Assert.Contains("metadata%5Breference%5D=RC-10", posted[0]);
+
+  Http.Post.Stub((url, body) => new HttpResponse { StatusCode = 402, Body =
+    "{\"error\":{\"type\":\"card_error\",\"code\":\"card_declined\",\"decline_code\":\"insufficient_funds\",\"message\":\"Your card has insufficient funds.\"}}" });
+  var declined = stripe.ChargeSaved("cus_9/pm_9", Order("RC-11", 10000));
+  Assert.Equal(PaymentState.Failed, declined.State);
+  Assert.Contains("insufficient funds", declined.Message);
+}
+
+[Test]
+void forgetting_a_kept_card_detaches_it_from_its_customer() {
+  var urls = new List<string>();
+  Http.Post.Stub((url, body) => { urls.Add(url); return new HttpResponse { StatusCode = 200, Body = "{\"id\":\"pm_9\"}" }; });
+  new StripePayments { ApiKey = "sk_test_x", WebhookSecret = "whsec_x" }.ForgetMethod("cus_9/pm_9");
+  Assert.Equal("https://api.stripe.com/v1/payment_methods/pm_9/detach", urls.Single());
+}
+
+// A payment in euros settled into a kronor balance: Stripe converted it, and its balance transaction says at what rate
+// (`exchange_rate`: the payment's amount × it = the balance's). The books book the currency gain or loss from it.
+[Test]
+void a_payment_stripe_converted_carries_the_rate_it_settled_at() {
+  Http.Get.Stub((url, headers) => url.Contains("/v1/payouts")
+    ? new HttpResponse { StatusCode = 200, Body = "{\"data\":[{\"id\":\"po_2\",\"amount\":120050,\"arrival_date\":1790000000,\"currency\":\"sek\",\"status\":\"paid\"}],\"has_more\":false}" }
+    : new HttpResponse { StatusCode = 200, Body = "{\"data\":["
+        + "{\"id\":\"txn_3\",\"amount\":123200,\"fee\":3150,\"net\":120050,\"type\":\"charge\",\"exchange_rate\":11.2,\"source\":{\"id\":\"ch_3\",\"payment_intent\":\"pi_9\"}}],\"has_more\":false}" });
+  var payout = new StripePayments { ApiKey = "sk_test_x", WebhookSecret = "whsec_x" }.Payouts(new DateTime(2026, 9, 1), new DateTime(2026, 9, 30)).Single();
+  Assert.Equal("SEK", payout.Currency);
+  var line = payout.Lines.Single();
+  Assert.Equal(123200, line.Amount);
+  Assert.Equal(11.2m, line.SettledRate);                          // €110 × 11.2 = 1,232 kr
+}

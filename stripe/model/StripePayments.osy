@@ -1,0 +1,203 @@
+namespace Osysharp.Payments.Stripe;
+
+using Osysharp.Payments;
+
+/// Stripe as a way to pay — card, wallets and whatever else Stripe's hosted Checkout offers the customer — through
+/// the `Osysharp.Payments` contract. List it among your app's providers:
+///
+///     new StripePayments { ApiKey = Secret.StripeApiKey, WebhookSecret = Secret.StripeWebhookSecret }
+///
+/// and point a Stripe webhook (`checkout.session.completed`, `refund.created`, `refund.updated`) at the endpoint
+/// your app gives the provider's events.
+///
+/// ⚑ The money is taken at checkout, so `Capture` does nothing and `Cancel` of a paid payment is a `Refund`.
+public class StripePayments : IPaymentProvider {
+  public string Key { get; set; } = "stripe";
+  public string Label { get; set; } = "Card";
+  public string Description { get; set; } = "Card or wallet, on Stripe's secure page.";
+  public bool CapturesLater { get; } = false;
+  public bool IsManual { get; } = false;
+  /// Stripe signs every event in this header.
+  public List<string> EventHeaders { get; } = ["Stripe-Signature"];
+
+  /// `sk_test_…` while you build, `sk_live_…` in production.
+  public string ApiKey = "";
+  /// `whsec_…`, from the webhook endpoint in Stripe's dashboard.
+  public string WebhookSecret = "";
+  /// Stripe cannot be merchant of record for PHYSICAL goods, and a new account refuses a session without this set
+  /// false. Set it true (or null for the account's default) when you sell something digital.
+  public bool? ManagedPayments = false;
+
+  /// A card kept at checkout (`PaymentRequest.SaveMethod`) is charged later without the customer.
+  public bool SavesMethods { get; } = true;
+
+  public bool IsReady() { return ApiKey != "" && WebhookSecret != ""; }
+  /// Stripe takes every currency a shop is likely to sell in, converting where the account needs it.
+  public string CurrencyRefusal(string currency, string country, string sellers) { return ""; }
+
+  StripeClient Client() { return new StripeClient { ApiKey = ApiKey }; }
+
+  public PaymentStart Start(PaymentRequest request) {
+    List<CheckoutLineItem> lines = [];
+    foreach (var l in request.Lines.Where(x => x.UnitPrice > 0)) {
+      lines.Add(new CheckoutLineItem { ProductName = l.Name, UnitAmount = l.UnitPrice, Currency = request.Currency.ToLower(),
+                                       Quantity = l.Quantity });
+    }
+    // A checkout page's lines cannot be negative, so a discount goes on as ONE coupon for what the negative lines add
+    // up to — keyed on the payment, so a retried start makes one coupon, not two.
+    List<string> coupons = [];
+    var off = -request.Lines.Where(x => x.UnitPrice < 0).Sum(x => x.UnitPrice * x.Quantity);
+    if (off > 0) {
+      var name = string.Join(", ", request.Lines.Where(x => x.UnitPrice < 0).Select(x => x.Name));
+      var coupon = Client().CreateCoupon(off, request.Currency, name == "" ? "Discount" : name,
+                                         request.IdempotencyKey == "" ? null : "coupon-" + request.IdempotencyKey);
+      coupons.Add(coupon.CouponId ?? "");
+    }
+    if (lines.Count == 0) {
+      lines.Add(new CheckoutLineItem { ProductName = request.Description, UnitAmount = request.Amount,
+                                       Currency = request.Currency.ToLower() });
+    }
+    var session = Client().CreateCheckoutSession(new CheckoutSessionRequest {
+      LineItems = lines,
+      Coupons = coupons,
+      CustomerEmail = request.CustomerEmail,
+      ClientReferenceId = request.Reference,
+      ManagedPayments = ManagedPayments,
+      SaveForLater = request.SaveMethod,
+      SuccessUrl = request.ReturnUrl.Replace("{token}", "{CHECKOUT_SESSION_ID}"),
+      CancelUrl = request.CancelUrl,
+    }, request.IdempotencyKey == "" ? null : "checkout-" + request.IdempotencyKey);
+    return new PaymentStart { RedirectUrl = session.Url ?? "", ProviderRef = session.SessionId };
+  }
+
+  public PaymentCheck Check(string reference, long amount, string token) {
+    if (token == "") { return new PaymentCheck { Message = "The payment was not completed." }; }
+    var session = Client().GetCheckoutSession(token);
+    // The session must be THIS payment's — somebody else's paid session buys nothing here — and for its amount.
+    if (session.ClientReferenceId != reference || session.AmountTotal != amount) {
+      return new PaymentCheck { Message = "That payment is not for this order." };
+    }
+    if (session.PaymentStatus != "paid") { return new PaymentCheck { Message = "The payment has not gone through." }; }
+    var check = new PaymentCheck { State = PaymentState.Paid, ProviderRef = session.PaymentIntent ?? "" };
+    Kept(session.PaymentIntent ?? "", check);
+    return check;
+  }
+
+  /// When the payment kept its way to pay, what a later charge takes — "cus_…/pm_…" — and the card's name.
+  void Kept(string paymentIntent, PaymentCheck into) {
+    if (paymentIntent == "") { return; }
+    var intent = Client().GetPaymentIntent(paymentIntent);
+    if (intent.SetupFutureUsage != "off_session" || intent.Customer == null || intent.PaymentMethod == null) { return; }
+    into.SavedMethod = intent.Customer + "/" + intent.PaymentMethod;
+    var method = Client().GetPaymentMethod(intent.PaymentMethod!);
+    into.SavedMethodLabel = method.Card == null ? "Saved payment method"
+      : $"{Capitalised(method.Card.Brand ?? "card")} •••• {method.Card.Last4 ?? ""}";
+  }
+
+  string Capitalised(string s) { return s == "" ? s : s.Substring(0, 1).ToUpper() + s.Substring(1); }
+
+  /// A renewal: a payment intent on the kept card, confirmed at once, with nobody there. A decline — or a bank that
+  /// wants the customer to confirm it themselves — answers Failed with Stripe's sentence, never an exception.
+  public PaymentCheck ChargeSaved(string savedMethod, PaymentRequest request) {
+    var slash = savedMethod.IndexOf("/");
+    if (slash <= 0) { return new PaymentCheck { State = PaymentState.Failed, Message = "That saved card is not one Stripe kept." }; }
+    var metadata = new Dictionary<string, string>();
+    metadata.Add("reference", request.Reference);
+    StripePaymentIntent intent;
+    try {
+      intent = Client().CreatePaymentIntent(new PaymentIntentRequest {
+        Amount = request.Amount, Currency = request.Currency.ToLower(), Customer = savedMethod.Substring(0, slash),
+        PaymentMethod = savedMethod.Substring(slash + 1), OffSession = true, Description = request.Description,
+        Metadata = metadata,
+      }, request.IdempotencyKey == "" ? null : "saved-" + request.IdempotencyKey);
+    }
+    catch (ExternalServiceException ex) {
+      return new PaymentCheck { State = PaymentState.Failed, Message = ex.Message };
+    }
+    if (intent.Status == "succeeded") { return new PaymentCheck { State = PaymentState.Paid, ProviderRef = intent.IntentId ?? "" }; }
+    if (intent.Status == "processing") { return new PaymentCheck { State = PaymentState.Pending, ProviderRef = intent.IntentId ?? "" }; }
+    return new PaymentCheck { State = PaymentState.Failed, ProviderRef = intent.IntentId ?? "",
+                              Message = intent.LastPaymentError?.Message ?? "The card was not charged." };
+  }
+
+  public void ForgetMethod(string savedMethod) {
+    var slash = savedMethod.IndexOf("/");
+    if (slash > 0) { Client().DetachPaymentMethod(savedMethod.Substring(slash + 1)); }
+  }
+
+  public void Capture(string providerRef, long amount) { }
+
+  /// Stripe's payouts to the bank, each with the charges and refunds it settles (by payment intent — the app's
+  /// `ProviderRef`) and the fees Stripe kept on them.
+  public List<Payout> Payouts(DateTime from, DateTime to) {
+    var stripe = Client();
+    List<Payout> payouts = [];
+    foreach (var p in stripe.ListPayouts(from, to)) {
+      var payout = new Payout { Id = p.PayoutId ?? "", Currency = (p.Currency ?? "").ToUpper(), Net = p.Amount,
+                                PaidAt = DateTimeOffset.FromUnixTimeSeconds(p.ArrivalDate).UtcDateTime };
+      foreach (var t in stripe.PayoutTransactions(payout.Id)) {
+        if (t.Type == "payout") { continue; }                 // the payout's own row: the money leaving the balance
+        payout.Fees = payout.Fees + t.Fee;
+        var kind = t.Type == "charge" || t.Type == "payment" ? "sale"
+                 : t.Type == "refund" || t.Type == "payment_refund" ? "refund"
+                 : t.Type == "stripe_fee" ? "fee" : "other";
+        payout.Lines.Add(new PayoutLine { ProviderRef = t.Source?.PaymentIntent ?? "", Kind = kind, Amount = t.Amount,
+                                          SettledRate = t.ExchangeRate ?? 0m });
+      }
+      payouts.Add(payout);
+    }
+    return payouts;
+  }
+
+  public PaymentRefund Refund(string providerRef, long amount, string reason, string idempotencyKey) {
+    var refund = Client().CreateRefund(providerRef, amount, "requested_by_customer",
+                                       idempotencyKey == "" ? null : "refund-" + idempotencyKey);
+    return new PaymentRefund { State = RefundStateOf(refund.Status ?? ""), RefundRef = refund.RefundId ?? "" };
+  }
+
+  /// A Checkout payment is taken at checkout, so there is nothing authorised to release; an unpaid session simply
+  /// expires.
+  public void Cancel(string providerRef) { }
+
+  public List<PaymentEvent> HandleEvent(string body, Dictionary<string, string> headers) {
+    var signature = headers.ContainsKey("Stripe-Signature") ? headers["Stripe-Signature"]
+                  : headers.ContainsKey("stripe-signature") ? headers["stripe-signature"] : "";
+    var e = new StripeWebhook { SigningSecret = WebhookSecret }.Verify(body, signature);   // throws for a forgery
+    // A test key's events settle test payments, and a test event never settles a live one.
+    if (e.Livemode != ApiKey.StartsWith("sk_live_")) { return []; }
+    if (e.Type == "checkout.session.completed" && e.Object?.PaymentStatus == "paid") {
+      var paid = new PaymentEvent {
+        Kind = PaymentEventKind.Paid, Reference = e.Object?.ClientReferenceId ?? "", ProviderRef = e.Object?.PaymentIntent ?? "",
+        State = PaymentState.Paid, Amount = e.Object?.AmountTotal ?? 0,
+      };
+      // A session that made a customer may have kept the card — asked of Stripe, as the return page asks.
+      if (e.Object?.Customer != null) {
+        var kept = new PaymentCheck();
+        Kept(paid.ProviderRef, kept);
+        paid.SavedMethod = kept.SavedMethod;
+        paid.SavedMethodLabel = kept.SavedMethodLabel;
+      }
+      return [paid];
+    }
+    // A renewal charged without the customer that Stripe finished later (`processing` at the time).
+    if (e.Type == "payment_intent.succeeded" && e.Object?.Metadata != null && e.Object!.Metadata!.ContainsKey("reference")) {
+      return [new PaymentEvent {
+        Kind = PaymentEventKind.Paid, Reference = e.Object!.Metadata!["reference"], ProviderRef = e.Object?.ObjectId ?? "",
+        State = PaymentState.Paid, Amount = e.Object?.Amount ?? 0,
+      }];
+    }
+    if (e.Type == "refund.created" || e.Type == "refund.updated") {
+      return [new PaymentEvent {
+        Kind = PaymentEventKind.Refund, ProviderRef = e.Object?.PaymentIntent ?? "", RefundRef = e.Object?.ObjectId ?? "",
+        RefundState = RefundStateOf(e.Object?.Status ?? ""), Amount = e.Object?.Amount ?? 0,
+      }];
+    }
+    return [new PaymentEvent { Kind = PaymentEventKind.Other }];
+  }
+
+  RefundState RefundStateOf(string status) {
+    return status == "succeeded" ? RefundState.Succeeded
+         : status == "failed" || status == "canceled" ? RefundState.Failed
+         : RefundState.Pending;
+  }
+}

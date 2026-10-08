@@ -1,0 +1,139 @@
+namespace Osysharp.Payments.Stripe;
+
+/// One webhook event that has been PROVEN to come from Stripe.
+///
+/// ⭐ THE TYPE IS THE POINT. A handler that takes a `StripeVerifiedEvent` cannot be handed an unverified one, so
+///    "did we check the signature?" stops being a question anybody has to remember to ask — it is answered by what
+///    the function accepts.
+public class StripeVerifiedEvent {
+  /// `payment_intent.succeeded`, `checkout.session.completed`, …
+  public string Type = "";
+  public string EventId = "";
+  /// When Stripe created it, unix seconds.
+  public long Created = 0;
+  /// ⛔ FALSE FOR A TEST-MODE EVENT. Check it before you fulfil anything: a test key for your account — which every
+  ///    developer who has run the app locally holds — can otherwise drive your production fulfilment.
+  public bool Livemode = false;
+  /// The common fields of `data.object`. See `StripeEventObject`: it is deliberately a subset.
+  public StripeEventObject? Object;
+  /// The verified raw JSON, byte-for-byte as it was signed. Deserialize it into a class of your own for any event
+  /// whose shape `StripeEventObject` does not cover — that is ordinary Osy# and needs nothing from this kit.
+  public string Payload = "";
+}
+
+/// Verifies that a webhook request really came from Stripe.
+///
+///   [AllowAnonymous] void StripeHook(string body, string signature) {
+///     var e = new StripeWebhook { SigningSecret = Secret.StripeWebhookSecret }.Verify(body, signature);
+///     if (!e.Livemode) { return; }
+///     if (e.Type == "checkout.session.completed") { Fulfil(e.Object?.PaymentIntent ?? ""); }
+///   }
+///
+/// ⛔ THE ENDPOINT IS PUBLIC AND UNAUTHENTICATED — Stripe cannot log in. The signature IS the authentication, and
+///    without this check the endpoint is "anyone on the internet may mark any order paid". It is the single most
+///    important twenty lines in a payments integration and the one most often skipped, because an unverified
+///    handler works perfectly in testing.
+///
+/// ⚠ YOU MUST PASS THE RAW REQUEST BODY, exactly as it arrived. The signature covers the bytes Stripe sent; a body
+///   that has been parsed and re-serialized has different whitespace and different key order, and will fail to
+///   verify for reasons that look nothing like the cause.
+public class StripeWebhook {
+  /// The endpoint's signing secret — `whsec_…`, shown once when you create the endpoint in Stripe's dashboard.
+  /// ⚠ NOT the API key. They are different secrets and swapping them fails every verification.
+  public string SigningSecret = "";
+
+  /// How far out of date a signature may be, in seconds. Stripe's own SDKs default to five minutes, and the point
+  /// is REPLAY: without it a signature captured from a real request stays valid forever.
+  ///
+  /// ⚠ ZERO DISABLES THE CHECK. That is here for one honest reason — replaying a captured event in a test, where
+  ///   the timestamp is a year old and the payload is the thing under test. Setting it to zero on a live endpoint
+  ///   gives back the replay window this field exists to close.
+  public long ToleranceSeconds = 300;
+
+  /// Verify and parse. Throws `ValidationException` if the request is not provably Stripe's — which an endpoint
+  /// should answer as 400, never as 500, and never by processing it anyway.
+  public StripeVerifiedEvent Verify(string payload, string signatureHeader) {
+    if (SigningSecret == "") {
+      throw new ValidationException("This webhook has no `SigningSecret`. Set it to the endpoint's `whsec_…` secret from the Stripe dashboard — not the API key, which is a different secret and will fail every verification.");
+    }
+    if (signatureHeader == "") {
+      throw new ValidationException("This request carries no `Stripe-Signature` header, so it cannot have come from Stripe. Pass the header value through from the request.");
+    }
+
+    // `t=1492774577,v1=5257a869…,v1=<an older key's signature during a secret rotation>`
+    var timestamp = "";
+    List<string> signatures = [];
+    foreach (var part in signatureHeader.Split(",")) {
+      var pair = part.Trim();
+      var eq = pair.IndexOf("=");
+      if (eq <= 0) { continue; }
+      var name = pair.Substring(0, eq);
+      var value = pair.Substring(eq + 1);
+      if (name == "t") { timestamp = value; }
+      // ⚑ MORE THAN ONE `v1` IS NORMAL, not an attack. Stripe signs with every active secret while you roll one
+      //   over, so accepting ANY match is what makes a rotation possible without downtime.
+      if (name == "v1") { signatures.Add(value); }
+    }
+
+    if (timestamp == "") {
+      throw new ValidationException($"The `Stripe-Signature` header has no `t=` timestamp: '{signatureHeader}'. That is not a header Stripe produced.");
+    }
+    if (signatures.Count == 0) {
+      throw new ValidationException($"The `Stripe-Signature` header carries no `v1=` signature: '{signatureHeader}'. A `v0` signature belongs to Stripe's older scheme and this kit does not accept it.");
+    }
+
+    if (ToleranceSeconds > 0) {
+      var sent = long.Parse(timestamp);
+      var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+      var drift = now > sent ? now - sent : sent - now;
+      if (drift > ToleranceSeconds) {
+        throw new ValidationException($"This webhook is {drift}s out of date and the tolerance is {ToleranceSeconds}s, so it is refused as a possible replay. If your server's clock is wrong the whole endpoint fails this way — check that before widening the tolerance.");
+      }
+    }
+
+    // What Stripe signed: the timestamp, a dot, and the raw body.
+    var signed = timestamp + "." + payload;
+    var expected = Crypto.ToHex(Crypto.HmacSha256(Text.ToBytes(SigningSecret), Text.ToBytes(signed)));
+
+    var matched = false;
+    foreach (var candidate in signatures) {
+      if (FixedTimeEquals(expected, candidate)) { matched = true; }
+    }
+    if (!matched) {
+      // ⛔ THE MESSAGE NAMES NEITHER SIGNATURE. Echoing the expected value back turns a 400 into an oracle that
+      //    hands an attacker the answer; echoing the received one puts attacker-controlled text in your logs.
+      throw new ValidationException("This webhook's signature does not match. Either it did not come from Stripe, or the body was re-serialized before it got here — the signature covers the RAW bytes, so pass the request body through untouched.");
+    }
+
+    var envelope = JsonSerializer.Deserialize<StripeEventEnvelope>(payload);
+    return new StripeVerifiedEvent {
+      Type = envelope.Type ?? "",
+      EventId = envelope.EventId ?? "",
+      Created = envelope.Created,
+      Livemode = envelope.Livemode,
+      Object = envelope.Data?.Object,
+      Payload = payload,
+    };
+  }
+
+  /// Compare two hex signatures without returning early on the first differing character.
+  ///
+  /// ⚑ WHY NOT `==`. An ordinary string comparison stops at the first mismatch, so the time it takes reveals how
+  ///   many leading characters were right — and a webhook endpoint accepts unlimited attempts from anyone. The
+  ///   difference is small and the attack is impractical over a network, which is exactly the reasoning that gets
+  ///   it skipped; every Stripe SDK does this, and it costs one loop.
+  ///
+  /// ⚠ IT IS NOT BRANCH-FREE, and claiming otherwise would be the kind of security claim this repository refuses to
+  ///   make without a test behind it. What it does hold is that the loop runs over the whole string regardless of
+  ///   where the values differ, which is the property that matters here.
+  bool FixedTimeEquals(string a, string b) {
+    if (a.Length != b.Length) { return false; }
+    var differences = 0;
+    var left = a.ToCharArray();
+    var right = b.ToCharArray();
+    for (var i = 0; i < left.Count; i = i + 1) {
+      if (left[i] != right[i]) { differences = differences + 1; }
+    }
+    return differences == 0;
+  }
+}

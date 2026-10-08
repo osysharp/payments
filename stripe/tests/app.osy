@@ -1,0 +1,20 @@
+// The producer's test project for Osysharp.Payments.Stripe — an ordinary app that depends on the kit by name.
+//
+// ⭐ IT READS THE WORKING TREE, not the last release: the repository's `osy.workspace` lists `kits/*`, so `use
+//    Osysharp.Payments.Stripe` resolves from the directory beside this one. Without that every run would test the version
+//    published yesterday, and pass.
+//
+// ⛔ THIS PROJECT IS NOT PART OF THE PACKAGE. `kits/stripe/package.osy` names it with the `tests` SETTING, which
+//    contributes nothing to the archive — a consumer never receives it, compiles it or pays for it. What the setting
+//    DOES do is make `osy publish` run these tests and refuse a version that fails them.
+app StripeKitTests {
+  model "model/**/*.osy";
+  tests "**/*.test.osy";
+
+  // The kit asks for one host, and this app grants it — a package gets no authority from being depended on.
+  use Osysharp.Payments.Stripe@0 { egress "api.stripe.com"; }
+  // The tests STUB `Http.Post` and `Http.Get`, so this app names the capability it stubs. A dependency is not
+  // inherited from a package: the kit's own `use Osysharp.Http;` puts `Http.*` in the KIT's scope, not its consumer's.
+  use Osysharp.Http;
+  use Osysharp.Payments@0;
+}

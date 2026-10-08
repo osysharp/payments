@@ -1,0 +1,325 @@
+namespace StripeKitTests;
+
+using Osysharp.Http;
+using Osysharp.Payments.Stripe;
+
+// The kit's own tests. `osy publish` runs them and refuses to publish a version that fails — see the `tests` setting
+// in ../package.osy.
+//
+// ⭐ EVERY ONE OF THEM ASSERTS WHAT WENT ON THE WIRE, not that a call returned. A payments kit's whole job is the
+//    shape of one form-encoded body; a test that only checked for an id would pass against a body that charged the
+//    wrong amount in the wrong currency.
+//
+// ⚠ THE ASSERTIONS QUOTE PERCENT-ENCODED NAMES — `metadata%5Border_id%5D`, not `metadata[order_id]`. That is what
+//   `FormBody.Encode` writes and what actually travels; asserting the pretty form would be asserting a body
+//   nobody sends.
+
+[Test]
+void a_payment_intent_is_FORM_encoded_and_never_json() {
+  // ⛔ THE ONE THING MOST PEOPLE GET WRONG. Stripe answers JSON and will not accept it — a JSON request body comes
+  //    back as a complaint about a missing parameter, which reads like the caller forgot a field.
+  var posted = new List<string>();
+  var urls = new List<string>();
+  Http.Post.Stub((url, body) => {
+    urls.Add(url);
+    posted.Add(body);
+    return new HttpResponse { StatusCode = 200, Body = "{\"id\":\"pi_1\",\"status\":\"requires_payment_method\",\"amount\":2000,\"currency\":\"sek\",\"client_secret\":\"pi_1_secret_x\"}" };
+  });
+
+  var intent = ChargeForOrder(2000, "sek", "A-1001");
+
+  Assert.Equal("https://api.stripe.com/v1/payment_intents", urls[0]);
+  Assert.Contains("amount=2000", posted[0]);
+  Assert.Contains("currency=sek", posted[0]);
+  // Not a brace in sight: if this body were JSON it would start with one.
+  Assert.DoesNotContain("{", posted[0]);
+  Assert.Equal("pi_1", intent.IntentId);
+  Assert.Equal("pi_1_secret_x", intent.ClientSecret);
+}
+
+[Test]
+void the_status_is_carried_back_because_a_DECLINE_is_a_200() {
+  // ⛔ THE CLASSIC PAYMENTS BUG. A refused card is normally a successful HTTP call carrying
+  //    `requires_payment_method`. A caller that only checks for an exception has written a flow that treats a
+  //    decline as a sale.
+  Http.Post.Stub((url, body) => new HttpResponse {
+    StatusCode = 200,
+    Body = "{\"id\":\"pi_2\",\"status\":\"requires_payment_method\",\"amount\":2000,\"currency\":\"sek\"}",
+  });
+
+  var intent = ChargeForOrder(2000, "sek", "A-1002");
+
+  Assert.Equal("requires_payment_method", intent.Status);
+}
+
+[Test]
+void metadata_is_bracket_nested_and_sorted() {
+  var posted = new List<string>();
+  Http.Post.Stub((url, body) => {
+    posted.Add(body);
+    return new HttpResponse { StatusCode = 200, Body = "{\"id\":\"pi_3\"}" };
+  });
+
+  ChargeForOrder(2000, "sek", "A-1003");
+
+  Assert.Contains("metadata%5Bchannel%5D=web", posted[0]);
+  Assert.Contains("metadata%5Border_id%5D=A-1003", posted[0]);
+  // ⚑ SORTED, so one body is one body. Dictionary order is not a promise, and a test that asserted a whole body
+  //   would otherwise be flaky for a reason nobody would find.
+  Assert.True(posted[0].IndexOf("metadata%5Bchannel%5D") < posted[0].IndexOf("metadata%5Border_id%5D"));
+}
+
+[Test]
+void naming_no_payment_methods_lets_stripe_offer_all_of_them() {
+  // The setting that makes Klarna or iDEAL appear for a customer in the right country without a code change.
+  var posted = new List<string>();
+  Http.Post.Stub((url, body) => { posted.Add(body); return new HttpResponse { StatusCode = 200, Body = "{\"id\":\"pi_4\"}" }; });
+
+  ChargeForOrder(2000, "sek", "A-1004");
+
+  Assert.Contains("automatic_payment_methods%5Benabled%5D=true", posted[0]);
+  Assert.DoesNotContain("payment_method_types", posted[0]);
+}
+
+[Test]
+void naming_payment_methods_indexes_them_and_drops_the_automatic_flag() {
+  // ⚠ THE TWO ARE MUTUALLY EXCLUSIVE at Stripe. Sending both is a 400 about a parameter the author set only one of.
+  var posted = new List<string>();
+  Http.Post.Stub((url, body) => { posted.Add(body); return new HttpResponse { StatusCode = 200, Body = "{\"id\":\"pi_5\"}" }; });
+
+  ChargeCardsOnly(2000);
+
+  Assert.Contains("payment_method_types%5B0%5D=card", posted[0]);
+  Assert.Contains("payment_method_types%5B1%5D=klarna", posted[0]);
+  Assert.DoesNotContain("automatic_payment_methods", posted[0]);
+}
+
+[Test]
+void capture_later_asks_for_a_manual_capture() {
+  var posted = new List<string>();
+  Http.Post.Stub((url, body) => { posted.Add(body); return new HttpResponse { StatusCode = 200, Body = "{\"id\":\"pi_6\",\"status\":\"requires_capture\"}" }; });
+
+  var intent = AuthorizeNowCaptureLater(2000);
+
+  Assert.Contains("capture_method=manual", posted[0]);
+  Assert.Equal("requires_capture", intent.Status);
+}
+
+[Test]
+void an_optional_nobody_set_is_absent_rather_than_empty() {
+  // `description=` is a real instruction to Stripe to CLEAR a field. An unset optional must not send it.
+  var posted = new List<string>();
+  Http.Post.Stub((url, body) => { posted.Add(body); return new HttpResponse { StatusCode = 200, Body = "{\"id\":\"pi_7\"}" }; });
+
+  ChargeCardsOnly(2000);
+
+  Assert.DoesNotContain("description", posted[0]);
+  Assert.DoesNotContain("receipt_email", posted[0]);
+  Assert.DoesNotContain("customer=", posted[0]);
+}
+
+[Test]
+void a_zero_amount_is_refused_BEFORE_the_call_and_says_what_minor_units_are() {
+  // ⛔ THE REFUSAL THAT EARNS ITS PLACE. Stripe's own message for this names `amount`, which the author DID set —
+  //    to 20, meaning twenty kronor, which Stripe reads as twenty öre. Naming minor units here is the whole point.
+  var urls = new List<string>();
+  Http.Post.Stub((url, body) => { urls.Add(url); return new HttpResponse { StatusCode = 200, Body = "{}" }; });
+
+  var refusal = Assert.Throws<ExternalServiceException>(() => ChargeNothing());
+
+  Assert.Equal(0, urls.Count);
+  Assert.Contains("minor units", refusal.Message);
+  Assert.Contains("2000", refusal.Message);
+}
+
+[Test]
+void a_missing_currency_is_refused_BEFORE_the_call() {
+  var urls = new List<string>();
+  Http.Post.Stub((url, body) => { urls.Add(url); return new HttpResponse { StatusCode = 200, Body = "{}" }; });
+
+  var refusal = Assert.Throws<ExternalServiceException>(() => ChargeWithoutCurrency());
+
+  Assert.Equal(0, urls.Count);
+  Assert.Contains("Currency", refusal.Message);
+}
+
+[Test]
+void an_inline_checkout_line_carries_its_own_price_data() {
+  var posted = new List<string>();
+  var urls = new List<string>();
+  Http.Post.Stub((url, body) => {
+    urls.Add(url);
+    posted.Add(body);
+    return new HttpResponse { StatusCode = 200, Body = "{\"id\":\"cs_1\",\"url\":\"https://checkout.stripe.com/c/pay/cs_1\",\"status\":\"open\",\"payment_status\":\"unpaid\",\"amount_total\":44900}" };
+  });
+
+  var session = CheckoutInline("A-1010", 20000);
+
+  Assert.Equal("https://api.stripe.com/v1/checkout/sessions", urls[0]);
+  Assert.Contains("line_items%5B0%5D%5Bprice_data%5D%5Bunit_amount%5D=20000", posted[0]);
+  Assert.Contains("line_items%5B0%5D%5Bprice_data%5D%5Bcurrency%5D=sek", posted[0]);
+  Assert.Contains("line_items%5B0%5D%5Bprice_data%5D%5Bproduct_data%5D%5Bname%5D=Widget", posted[0]);
+  Assert.Contains("line_items%5B0%5D%5Bquantity%5D=2", posted[0]);
+  // …and the second line is indexed separately, with its own default quantity of one.
+  Assert.Contains("line_items%5B1%5D%5Bprice_data%5D%5Bunit_amount%5D=4900", posted[0]);
+  Assert.Contains("line_items%5B1%5D%5Bquantity%5D=1", posted[0]);
+  Assert.Equal("https://checkout.stripe.com/c/pay/cs_1", session.Url);
+  Assert.Equal("unpaid", session.PaymentStatus);
+}
+
+[Test]
+void the_client_reference_goes_out_on_the_session_and_comes_back_on_it() {
+  // ⭐ HOW A PAYMENT IS TIED TO YOUR ORDER without trusting the browser: the id rides out on the session and Stripe
+  //    reports it back — on the session a return page asks about, and on the webhook event. Without it an app has to
+  //    dig through metadata JSON by hand, or match on an amount, which is not an identity.
+  var posted = new List<string>();
+  Http.Post.Stub((url, body) => {
+    posted.Add(body);
+    return new HttpResponse { StatusCode = 200, Body = "{\"id\":\"cs_9\",\"url\":\"https://checkout.stripe.com/c/pay/cs_9\"}" };
+  });
+  Http.Get.Stub(url => new HttpResponse {
+    StatusCode = 200,
+    Body = "{\"id\":\"cs_9\",\"payment_status\":\"paid\",\"client_reference_id\":\"A-1077\"}",
+  });
+
+  CheckoutInline("A-1077", 20000);
+  var read = ReadSession("cs_9");
+
+  Assert.Contains("client_reference_id=A-1077", posted[0]);
+  Assert.Equal("A-1077", read.ClientReferenceId);
+}
+
+[Test]
+void a_physical_goods_shop_can_turn_managed_payments_off_and_an_error_carries_its_dashboard_link() {
+  // ⭐ MEASURED 2026-09-26 against a real, new Stripe sandbox: every session was refused — "the product tax code is
+  //    missing … required for Managed Payments, which is enabled by default on your account". A physical-goods shop
+  //    cannot be Managed Payments at all, so it has to say so per session.
+  var posted = new List<string>();
+  Http.Post.Stub((url, body) => {
+    posted.Add(body);
+    return new HttpResponse { StatusCode = 400, Body = "{\"error\":{\"type\":\"invalid_request_error\",\"message\":\"nope\",\"request_log_url\":\"https://dashboard.stripe.com/test/logs/req_1\"}}" };
+  });
+
+  var thrown = "";
+  try { CheckoutPhysical("A-2001"); } catch (Exception ex) { thrown = ex.Message; }
+
+  Assert.Contains("managed_payments%5Benabled%5D=false", posted[0]);
+  Assert.Contains("https://dashboard.stripe.com/test/logs/req_1", thrown);
+}
+
+[Test]
+void a_catalogue_line_names_the_price_and_sends_no_price_data() {
+  var posted = new List<string>();
+  Http.Post.Stub((url, body) => { posted.Add(body); return new HttpResponse { StatusCode = 200, Body = "{\"id\":\"cs_2\"}" }; });
+
+  CheckoutFromCatalogue("price_abc");
+
+  Assert.Contains("line_items%5B0%5D%5Bprice%5D=price_abc", posted[0]);
+  Assert.Contains("line_items%5B0%5D%5Bquantity%5D=3", posted[0]);
+  Assert.DoesNotContain("price_data", posted[0]);
+}
+
+[Test]
+void a_line_naming_BOTH_price_kinds_is_refused_rather_than_silently_preferring_one() {
+  var urls = new List<string>();
+  Http.Post.Stub((url, body) => { urls.Add(url); return new HttpResponse { StatusCode = 200, Body = "{}" }; });
+
+  var refusal = Assert.Throws<ExternalServiceException>(() => CheckoutWithBothPriceKinds());
+
+  Assert.Equal(0, urls.Count);
+  Assert.Contains("catalogue price AND an inline one", refusal.Message);
+}
+
+[Test]
+void a_session_with_nowhere_to_send_the_customer_back_is_refused() {
+  var urls = new List<string>();
+  Http.Post.Stub((url, body) => { urls.Add(url); return new HttpResponse { StatusCode = 200, Body = "{}" }; });
+
+  var refusal = Assert.Throws<ExternalServiceException>(() => CheckoutWithNoDestination());
+
+  Assert.Equal(0, urls.Count);
+  Assert.Contains("SuccessUrl", refusal.Message);
+}
+
+[Test]
+void a_session_naming_two_identities_is_refused_where_the_author_can_see_why() {
+  // Stripe's own refusal for this names a JSON field and not the reason. Ours names the choice.
+  var urls = new List<string>();
+  Http.Post.Stub((url, body) => { urls.Add(url); return new HttpResponse { StatusCode = 200, Body = "{}" }; });
+
+  var refusal = Assert.Throws<ExternalServiceException>(() => CheckoutNamingTwoIdentities());
+
+  Assert.Equal(0, urls.Count);
+  Assert.Contains("not both", refusal.Message);
+}
+
+[Test]
+void a_full_refund_OMITS_the_amount_and_a_partial_one_names_it() {
+  // ⚑ THE DIFFERENCE IS AN ABSENT PARAMETER. Sending `amount=0` would refund nothing and answer success, which is
+  //   the worst available outcome: the customer is not refunded and nothing anywhere says so.
+  var posted = new List<string>();
+  Http.Post.Stub((url, body) => { posted.Add(body); return new HttpResponse { StatusCode = 200, Body = "{\"id\":\"re_1\",\"status\":\"succeeded\"}" }; });
+
+  RefundEverything("pi_100");
+  RefundPart("pi_100", 500);
+
+  Assert.Contains("payment_intent=pi_100", posted[0]);
+  Assert.DoesNotContain("amount", posted[0]);
+  Assert.Contains("reason=requested_by_customer", posted[0]);
+  Assert.Contains("amount=500", posted[1]);
+}
+
+[Test]
+void the_idempotency_key_and_the_credential_reach_the_wire() {
+  // ⭐ THE ASSERTION THAT MATTERS MOST IN THIS FILE. A retry that carries a DIFFERENT key charges the customer
+  //    twice, and every body-shape assertion above stays green while it happens.
+  var keys = new List<string>();
+  var auth = new List<string>();
+  Http.Post.Stub((url, body, headers) => {
+    keys.Add(headers["Idempotency-Key"]);
+    auth.Add(headers["Authorization"]);
+    return new HttpResponse { StatusCode = 200, Body = "{\"id\":\"pi_8\"}" };
+  });
+
+  ChargeForOrder(2000, "sek", "A-1020");
+  ChargeForOrder(2000, "sek", "A-1020");
+
+  Assert.Equal(2, keys.Count);
+  Assert.Equal(keys[0], keys[1]);
+  Assert.Equal("A-1020", keys[0]);
+  // A wrapper that computes a perfect key and forgets the credential passes every body assertion in this file.
+  Assert.Equal("Bearer sk_test_key", auth[0]);
+}
+
+[Test]
+void the_api_version_header_is_sent_only_when_it_is_pinned() {
+  // Empty means "this account's default", and the header must then be ABSENT — sending `Stripe-Version:` empty is
+  // a 400 rather than a fallback.
+  var headerSeen = new List<string>();
+  Http.Post.Stub((url, body, headers) => {
+    headerSeen.Add(headers.ContainsKey("Stripe-Version") ? headers["Stripe-Version"] : "<absent>");
+    return new HttpResponse { StatusCode = 200, Body = "{\"id\":\"pi_9\"}" };
+  });
+
+  ChargeCardsOnly(2000);
+
+  Assert.Equal("<absent>", headerSeen[0]);
+}
+
+[Test]
+void a_refusal_is_quoted_with_the_ISSUER_code_that_answers_the_support_call() {
+  // "Your card was declined" is what the customer sees. `insufficient_funds` versus `lost_card` is what tells you
+  // whether to suggest another card or stop asking — and dropping it makes every decline look the same in a log.
+  Http.Post.Stub((url, body) => new HttpResponse {
+    StatusCode = 402,
+    Body = "{\"error\":{\"type\":\"card_error\",\"code\":\"card_declined\",\"decline_code\":\"insufficient_funds\",\"message\":\"Your card has insufficient funds.\",\"param\":\"payment_method\"}}",
+  });
+
+  var refusal = Assert.Throws<ExternalServiceException>(() => ChargeForOrder(2000, "sek", "A-1030"));
+
+  Assert.Contains("card_error", refusal.Message);
+  Assert.Contains("card_declined", refusal.Message);
+  Assert.Contains("insufficient_funds", refusal.Message);
+  Assert.Contains("payment_method", refusal.Message);
+  Assert.Contains("402", refusal.Message);
+}

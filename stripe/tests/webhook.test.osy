@@ -1,0 +1,160 @@
+namespace StripeKitTests;
+
+using Osysharp.Payments.Stripe;
+
+// ⛔ THESE ARE THE SECURITY TESTS OF THE KIT. A webhook endpoint is public and unauthenticated — Stripe cannot log
+//    in — so the signature IS the authentication. Every refusal below is a way somebody could otherwise mark an
+//    order paid without paying, and an unverified handler passes a functional test perfectly.
+
+[Test]
+void a_correctly_signed_event_verifies_and_parses() {
+  var payload = "{\"id\":\"evt_1\",\"type\":\"checkout.session.completed\",\"created\":1700000000,\"livemode\":true,\"data\":{\"object\":{\"id\":\"cs_1\",\"object\":\"checkout.session\",\"payment_status\":\"paid\",\"amount_total\":44900,\"currency\":\"sek\",\"payment_intent\":\"pi_1\"}}}";
+  var now = NowSeconds();
+
+  var e = VerifyHook(payload, SignatureFor("whsec_test", payload, now));
+
+  Assert.Equal("checkout.session.completed", e.Type);
+  Assert.Equal("evt_1", e.EventId);
+  Assert.Equal(1700000000, e.Created);
+  Assert.True(e.Livemode);
+  Assert.Equal("paid", e.Object?.PaymentStatus);
+  Assert.Equal("pi_1", e.Object?.PaymentIntent);
+  Assert.Equal(44900, e.Object?.AmountTotal);
+}
+
+[Test]
+void the_verified_payload_is_carried_through_BYTE_FOR_BYTE() {
+  // ⚑ SO THAT `StripeEventObject` BEING A SUBSET COSTS NOTHING. An event kind it does not cover is one
+  //   `JsonSerializer.Deserialize<YourShape>(e.Payload)` away, over JSON that has been PROVEN to be Stripe's.
+  var payload = "{\"id\":\"evt_2\",\"type\":\"invoice.paid\",\"created\":1700000000,\"livemode\":false,\"data\":{\"object\":{\"id\":\"in_1\",\"object\":\"invoice\",\"hosted_invoice_url\":\"https://pay.stripe.com/i/1\"}}}";
+
+  var e = VerifyHook(payload, SignatureFor("whsec_test", payload, NowSeconds()));
+
+  Assert.Equal(payload, e.Payload);
+  Assert.Contains("hosted_invoice_url", e.Payload);
+}
+
+[Test]
+void a_TAMPERED_payload_is_refused() {
+  // The attack this whole class exists to stop: take a real event, change the amount, resend it.
+  var real = "{\"id\":\"evt_3\",\"type\":\"payment_intent.succeeded\",\"data\":{\"object\":{\"id\":\"pi_1\",\"amount\":100}}}";
+  var header = SignatureFor("whsec_test", real, NowSeconds());
+  var tampered = "{\"id\":\"evt_3\",\"type\":\"payment_intent.succeeded\",\"data\":{\"object\":{\"id\":\"pi_1\",\"amount\":999999}}}";
+
+  var refusal = Assert.Throws<ValidationException>(() => VerifyHook(tampered, header));
+
+  Assert.Contains("does not match", refusal.Message);
+}
+
+[Test]
+void a_signature_from_the_WRONG_SECRET_is_refused() {
+  var payload = "{\"id\":\"evt_4\",\"type\":\"payment_intent.succeeded\"}";
+
+  var refusal = Assert.Throws<ValidationException>(
+    () => VerifyHook(payload, SignatureFor("whsec_someone_elses", payload, NowSeconds())));
+
+  Assert.Contains("does not match", refusal.Message);
+}
+
+[Test]
+void the_refusal_quotes_NEITHER_signature() {
+  // ⛔ A 400 THAT ECHOES THE EXPECTED VALUE IS AN ORACLE — it hands an attacker the answer they were guessing at.
+  //    Echoing the RECEIVED one instead puts attacker-controlled text into your logs. Neither belongs in a message.
+  var payload = "{\"id\":\"evt_5\"}";
+  var header = SignatureFor("whsec_someone_elses", payload, NowSeconds());
+
+  var refusal = Assert.Throws<ValidationException>(() => VerifyHook(payload, header));
+
+  var expected = Crypto.ToHex(Crypto.HmacSha256(Text.ToBytes("whsec_test"),
+                                                Text.ToBytes(Convert.ToString(NowSeconds()) + "." + payload)));
+  Assert.DoesNotContain(expected, refusal.Message);
+  Assert.DoesNotContain("v1=", refusal.Message);
+}
+
+[Test]
+void an_OLD_signature_is_refused_as_a_possible_replay() {
+  // Without the tolerance, a signature captured from one real request stays valid forever.
+  var payload = "{\"id\":\"evt_6\",\"type\":\"payment_intent.succeeded\"}";
+  var longAgo = NowSeconds() - 4000;
+
+  var refusal = Assert.Throws<ValidationException>(
+    () => VerifyHook(payload, SignatureFor("whsec_test", payload, longAgo)));
+
+  Assert.Contains("replay", refusal.Message);
+  // ⚑ AND IT NAMES THE CLOCK, because a server whose time is wrong fails every webhook exactly this way and the
+  //   cause is nowhere near the endpoint.
+  Assert.Contains("clock", refusal.Message);
+}
+
+[Test]
+void a_zero_tolerance_accepts_an_old_signature_which_is_what_it_is_FOR() {
+  // The documented escape: replaying a captured event in a test, where the timestamp is a year old and the payload
+  // is the thing under test. On a live endpoint this gives back the replay window the field exists to close.
+  var payload = "{\"id\":\"evt_7\",\"type\":\"payment_intent.succeeded\",\"livemode\":false}";
+  var longAgo = 1700000000;
+
+  var e = VerifyHookWithTolerance(payload, SignatureFor("whsec_test", payload, longAgo), 0);
+
+  Assert.Equal("payment_intent.succeeded", e.Type);
+}
+
+[Test]
+void a_rotation_header_with_two_signatures_accepts_the_one_that_matches() {
+  // ⚑ MORE THAN ONE `v1` IS NORMAL, not an attack. Stripe signs with every active secret while a secret is being
+  //   rolled over, and rejecting the multi-signature header would make rotation require downtime.
+  var payload = "{\"id\":\"evt_8\",\"type\":\"payment_intent.succeeded\"}";
+  var header = RotationSignatureFor("whsec_retiring", "whsec_test", payload, NowSeconds());
+
+  var e = VerifyHook(payload, header);
+
+  Assert.Equal("evt_8", e.EventId);
+}
+
+[Test]
+void a_header_with_no_v1_signature_is_refused_and_says_why() {
+  var payload = "{\"id\":\"evt_9\"}";
+
+  var refusal = Assert.Throws<ValidationException>(() => VerifyHook(payload, "t=1700000000,v0=abc"));
+
+  Assert.Contains("v1", refusal.Message);
+}
+
+[Test]
+void a_header_with_no_timestamp_is_refused() {
+  var refusal = Assert.Throws<ValidationException>(() => VerifyHook("{}", "v1=abc"));
+
+  Assert.Contains("t=", refusal.Message);
+}
+
+[Test]
+void a_request_with_no_signature_header_at_all_is_refused() {
+  var refusal = Assert.Throws<ValidationException>(() => VerifyHook("{}", ""));
+
+  Assert.Contains("Stripe-Signature", refusal.Message);
+}
+
+[Test]
+void a_verifier_with_no_secret_names_WHICH_secret_it_wants() {
+  // ⚠ THE API KEY AND THE SIGNING SECRET ARE DIFFERENT SECRETS, and swapping them fails every verification with a
+  //   signature mismatch — which reads like an attack rather than a configuration mistake. Saying `whsec_…` here is
+  //   what stops that hour being spent.
+  var payload = "{\"id\":\"evt_10\"}";
+
+  var refusal = Assert.Throws<ValidationException>(
+    () => VerifyHookWithNoSecret(payload, SignatureFor("whsec_test", payload, NowSeconds())));
+
+  Assert.Contains("whsec_", refusal.Message);
+  Assert.Contains("not the API key", refusal.Message);
+}
+
+[Test]
+void livemode_is_carried_so_a_TEST_event_cannot_fulfil_a_real_order() {
+  // ⛔ Every developer who has run the app locally holds a test key for the account. Without this flag, any of them
+  //    can drive production fulfilment.
+  var payload = "{\"id\":\"evt_11\",\"type\":\"payment_intent.succeeded\",\"livemode\":false,\"data\":{\"object\":{\"id\":\"pi_1\",\"object\":\"payment_intent\",\"status\":\"succeeded\"}}}";
+
+  var e = VerifyHook(payload, SignatureFor("whsec_test", payload, NowSeconds()));
+
+  Assert.False(e.Livemode);
+  Assert.Equal("succeeded", e.Object?.Status);
+}

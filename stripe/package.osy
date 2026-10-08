@@ -1,0 +1,33 @@
+// Osysharp.Payments.Stripe — card payments through Stripe, written in Osy#.
+//
+// It needs nothing privileged. It is ordinary Osy# using only public APIs — classes that build a form-encoded body
+// and send it with `Http.*`, and a webhook verifier that is `Crypto.HmacSha256` and nothing else — so anyone could
+// have written it exactly as it is, for a provider the platform has never heard of.
+//
+// ⭐ WHAT THE PACKAGE DOOR BUYS A PAYMENTS INTEGRATION, and why it is worth saying out loud. `npm i stripe` gives you
+//    a library with unrestricted network access and a transitive dependency graph nobody reads. This kit declares the
+//    ONE host it may reach, below; an app that uses it grants that host or does not compile, and there is no
+//    expression in Osy# that lets the package reach anywhere else. For the one integration in an app that handles
+//    money, "it can provably only talk to Stripe" is a property worth having mechanically rather than by review.
+//
+// ⚠ IT ASKS FOR NO SECRET, deliberately — the same call `Osysharp.Resend` makes. The API key is a setting on the
+//   client, so the app names its own secret (`new StripeClient { ApiKey = Secret.Mine }`) and this package never
+//   learns which. A package that declared `secret "StripeApiKey"` would be dictating the app's secret names.
+package Osysharp.Payments.Stripe {
+  version     "0.1.0";
+  minPlatform "0.9.0";
+  summary     "card payments through Stripe — payment intents, checkout sessions, customers, refunds, verified webhooks, and a payments-contract provider.";
+
+  model "model/*.osy";
+  use Osysharp.Http;
+  // `StripePayments` is a provider under the payments contract, so an app lists Stripe beside any other way to pay.
+  use Osysharp.Payments@0;
+
+  // The only host this package may reach. Stripe's file-upload host (`files.stripe.com`) is deliberately absent:
+  // nothing here uploads a file, and a grant nothing uses is a grant nobody will notice being used later.
+  egress "api.stripe.com";
+
+  // The producer's own test project. It does NOT ship — `tests` is a SETTING, so the archive (the union of the role
+  // globs) never contains it — and `osy publish` runs it, refusing to publish a version whose own tests fail.
+  tests "tests";
+}

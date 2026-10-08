@@ -1,0 +1,36 @@
+namespace StripeKitTests;
+
+using Osysharp.Payments.Stripe;
+
+// Webhook helpers for the tests. `SignatureFor` builds a header the way STRIPE builds one — the same two lines
+// Stripe's own docs describe — so the verifier is tested against an independently-constructed signature rather than
+// against itself.
+
+/// The `Stripe-Signature` header for a payload, as Stripe would send it.
+string SignatureFor(string secret, string payload, long timestamp) {
+  var signed = Convert.ToString(timestamp) + "." + payload;
+  var v1 = Crypto.ToHex(Crypto.HmacSha256(Text.ToBytes(secret), Text.ToBytes(signed)));
+  return "t=" + Convert.ToString(timestamp) + ",v1=" + v1;
+}
+
+/// A header carrying TWO signatures, which is what an endpoint receives during a secret rotation.
+string RotationSignatureFor(string oldSecret, string newSecret, string payload, long timestamp) {
+  var signed = Convert.ToString(timestamp) + "." + payload;
+  var a = Crypto.ToHex(Crypto.HmacSha256(Text.ToBytes(oldSecret), Text.ToBytes(signed)));
+  var b = Crypto.ToHex(Crypto.HmacSha256(Text.ToBytes(newSecret), Text.ToBytes(signed)));
+  return "t=" + Convert.ToString(timestamp) + ",v1=" + a + ",v1=" + b;
+}
+
+long NowSeconds() { return DateTimeOffset.UtcNow.ToUnixTimeSeconds(); }
+
+StripeVerifiedEvent VerifyHook(string payload, string header) {
+  return new StripeWebhook { SigningSecret = "whsec_test" }.Verify(payload, header);
+}
+
+StripeVerifiedEvent VerifyHookWithTolerance(string payload, string header, long tolerance) {
+  return new StripeWebhook { SigningSecret = "whsec_test", ToleranceSeconds = tolerance }.Verify(payload, header);
+}
+
+StripeVerifiedEvent VerifyHookWithNoSecret(string payload, string header) {
+  return new StripeWebhook().Verify(payload, header);
+}

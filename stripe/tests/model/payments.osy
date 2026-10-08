@@ -1,0 +1,102 @@
+namespace StripeKitTests;
+
+using Osysharp.Payments.Stripe;
+
+// The app under test is deliberately thin: the KIT is what is being tested, so these functions exist only to give
+// the tests something to call that a real app would also have written.
+
+/// The client an app holds. In a real app `ApiKey` is `Secret.StripeApiKey`; here it is a literal, because no call
+/// ever leaves the process — every test stubs `Http.*`.
+StripeClient Pay() {
+  return new StripeClient { ApiKey = "sk_test_key" };
+}
+
+StripePaymentIntent ChargeForOrder(long minor, string currency, string reference) {
+  return Pay().CreatePaymentIntent(new PaymentIntentRequest {
+    Amount = minor,
+    Currency = currency,
+    Description = $"Order {reference}",
+    Metadata = new Dictionary<string, string> { { "order_id", reference }, { "channel", "web" } },
+  }, reference);
+}
+
+StripePaymentIntent ChargeCardsOnly(long minor) {
+  return Pay().CreatePaymentIntent(new PaymentIntentRequest {
+    Amount = minor, Currency = "sek", PaymentMethodTypes = ["card", "klarna"],
+  });
+}
+
+StripePaymentIntent AuthorizeNowCaptureLater(long minor) {
+  return Pay().CreatePaymentIntent(new PaymentIntentRequest { Amount = minor, Currency = "sek", CaptureLater = true });
+}
+
+StripePaymentIntent ChargeNothing() {
+  return Pay().CreatePaymentIntent(new PaymentIntentRequest { Amount = 0, Currency = "sek" });
+}
+
+StripePaymentIntent ChargeWithoutCurrency() {
+  return Pay().CreatePaymentIntent(new PaymentIntentRequest { Amount = 2000 });
+}
+
+StripePaymentIntent ReadIntent(string id) { return Pay().GetPaymentIntent(id); }
+
+StripeCheckoutSession CheckoutInline(string reference, long minor) {
+  return Pay().CreateCheckoutSession(new CheckoutSessionRequest {
+    LineItems = [
+      new CheckoutLineItem { ProductName = "Widget", UnitAmount = minor, Currency = "sek", Quantity = 2 },
+      new CheckoutLineItem { ProductName = "Shipping", UnitAmount = 4900, Currency = "sek" },
+    ],
+    SuccessUrl = "https://acme.test/thanks",
+    CancelUrl = "https://acme.test/cart",
+    CustomerEmail = "buyer@example.test",
+    ClientReferenceId = reference,
+    Metadata = new Dictionary<string, string> { { "order_id", reference } },
+  }, reference);
+}
+
+StripeCheckoutSession ReadSession(string id) { return Pay().GetCheckoutSession(id); }
+
+StripeCheckoutSession CheckoutPhysical(string reference) {
+  return Pay().CreateCheckoutSession(new CheckoutSessionRequest {
+    LineItems = [new CheckoutLineItem { ProductName = "Bicycle", UnitAmount = 98000, Currency = "eur" }],
+    SuccessUrl = "https://acme.test/thanks",
+    CancelUrl = "https://acme.test/cart",
+    ManagedPayments = false,
+  }, reference);
+}
+
+StripeCheckoutSession CheckoutFromCatalogue(string priceId) {
+  return Pay().CreateCheckoutSession(new CheckoutSessionRequest {
+    LineItems = [new CheckoutLineItem { Price = priceId, Quantity = 3 }],
+    SuccessUrl = "https://acme.test/thanks",
+    CancelUrl = "https://acme.test/cart",
+  });
+}
+
+StripeCheckoutSession CheckoutWithBothPriceKinds() {
+  return Pay().CreateCheckoutSession(new CheckoutSessionRequest {
+    LineItems = [new CheckoutLineItem { Price = "price_1", ProductName = "Widget", UnitAmount = 100, Currency = "sek" }],
+    SuccessUrl = "https://acme.test/thanks",
+    CancelUrl = "https://acme.test/cart",
+  });
+}
+
+StripeCheckoutSession CheckoutWithNoDestination() {
+  return Pay().CreateCheckoutSession(new CheckoutSessionRequest {
+    LineItems = [new CheckoutLineItem { ProductName = "Widget", UnitAmount = 100, Currency = "sek" }],
+  });
+}
+
+StripeCheckoutSession CheckoutNamingTwoIdentities() {
+  return Pay().CreateCheckoutSession(new CheckoutSessionRequest {
+    LineItems = [new CheckoutLineItem { ProductName = "Widget", UnitAmount = 100, Currency = "sek" }],
+    SuccessUrl = "https://acme.test/thanks",
+    CancelUrl = "https://acme.test/cart",
+    Customer = "cus_1",
+    CustomerEmail = "buyer@example.test",
+  });
+}
+
+StripeRefund RefundEverything(string intentId) { return Pay().CreateRefund(intentId, 0, "requested_by_customer"); }
+StripeRefund RefundPart(string intentId, long minor) { return Pay().CreateRefund(intentId, minor); }
+StripeCustomer NewCustomer(string email, string name) { return Pay().CreateCustomer(email, name); }

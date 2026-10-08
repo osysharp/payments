@@ -1,0 +1,416 @@
+namespace Osysharp.Payments.Stripe;
+
+using Osysharp.Http;
+
+/// One payment to collect, as an app writes it.
+public class PaymentIntentRequest {
+  /// ⛔ MINOR UNITS. 2000 is 20.00 SEK. Zero-decimal currencies (JPY, KRW) have no minor unit at all, so 2000 is
+  ///    ¥2000 — Stripe's own table is the authority and this kit does not second-guess it.
+  public long Amount = 0;
+  /// ISO 4217, lower case by convention: `sek`, `eur`, `usd`.
+  public string Currency = "";
+  /// An existing `cus_…` to charge, so the customer's saved cards are available.
+  public string? Customer;
+  /// What this is for. It appears on the customer's statement descriptor suffix and in your Stripe dashboard, and
+  /// it is the difference between a readable ledger and a list of ids.
+  public string? Description;
+  /// Stripe emails a receipt here once the payment succeeds. Test mode sends nothing, which is not a bug.
+  public string? ReceiptEmail;
+  /// Your own keys on the payment — `["order_id"] = "A-1001"`. See `FormBody.AddMap`: this is the join back to
+  /// your data and it is worth filling in every time.
+  public Dictionary<string, string> Metadata = new Dictionary<string, string>();
+  /// Leave empty to let Stripe offer whatever the account has enabled for the customer's country — which is how
+  /// Klarna, iDEAL and Swish appear without a code change. Set it (`["card"]`) only to deliberately narrow that.
+  public List<string> PaymentMethodTypes = [];
+  /// A kept `pm_…` of `Customer` to take it with, now, without the customer (`OffSession`).
+  public string? PaymentMethod;
+  /// Charge a kept way to pay while the customer is not there — a renewal. Confirms at once; a card whose bank wants
+  /// the customer to confirm it is refused rather than left waiting for someone who is not coming.
+  public bool OffSession = false;
+  /// AUTHORIZE now, capture later — for a shipped-goods flow where you must not take the money until dispatch.
+  /// The intent lands in `requires_capture` and `Capture` completes it. An uncaptured authorization expires,
+  /// typically in 7 days.
+  public bool CaptureLater = false;
+}
+
+/// One line on a hosted Checkout page. Either name an existing `Price`, or describe the item inline — not both.
+public class CheckoutLineItem {
+  /// An existing `price_…` from your Stripe catalogue.
+  public string? Price;
+  /// Inline instead of a catalogue price: what the customer sees.
+  public string? ProductName;
+  /// Inline price, in minor units.
+  public long UnitAmount = 0;
+  /// Inline currency. Left empty, the session's own currency is used.
+  public string Currency = "";
+  public long Quantity = 1;
+}
+
+/// A hosted Checkout page to send a customer to.
+public class CheckoutSessionRequest {
+  public List<CheckoutLineItem> LineItems = [];
+  /// Where Stripe returns the customer after payment. ⚠ REACHING IT IS NOT PROOF OF PAYMENT — a customer can open
+  /// that URL directly. Fulfil on the `checkout.session.completed` WEBHOOK, which is signed; treat this page as
+  /// "thank you", not as "paid".
+  public string SuccessUrl = "";
+  public string CancelUrl = "";
+  /// `payment` for one-off, `subscription` for recurring, `setup` to save a card without charging it.
+  public string Mode = "payment";
+  /// Prefills the email and, with it, the receipt.
+  public string? CustomerEmail;
+  /// An existing `cus_…`. Mutually exclusive with `CustomerEmail` — Stripe refuses both.
+  public string? Customer;
+  /// YOUR id for what this session pays for — an order reference, a booking. Stripe hands it back on the session and
+  /// on its `checkout.session.completed` event, which is how a webhook, or a return page asking Stripe, knows WHICH
+  /// order was paid without trusting anything the browser carried. Up to 200 characters.
+  public string? ClientReferenceId;
+  /// Stripe as MERCHANT OF RECORD ("Managed Payments") — on by default for new accounts, and it refuses any line
+  /// without a product tax code. It is for digital goods; a shop selling PHYSICAL things sets this `false`, or every
+  /// session is refused with "the product tax code is missing". Null leaves the account's default alone.
+  public bool? ManagedPayments;
+  /// Coupons taken off the whole session (`CreateCoupon`) — how a discount reaches a checkout page, whose lines
+  /// cannot be negative.
+  public List<string> Coupons = [];
+  public Dictionary<string, string> Metadata = new Dictionary<string, string>();
+  /// Keep the way the customer pays for charges without them (`payment` mode): Stripe makes a customer for it, the
+  /// page says the card is saved, and the payment intent carries the `pm_…` and `cus_…` a later charge takes.
+  public bool SaveForLater = false;
+}
+
+/// Card payments through Stripe. One factory in the app, then call through it:
+///
+///   StripeClient Pay() { return new StripeClient { ApiKey = Secret.StripeApiKey }; }
+///
+///   string CheckoutUrl(Order order) {
+///     var session = Pay().CreateCheckoutSession(new CheckoutSessionRequest {
+///       LineItems = [new CheckoutLineItem { ProductName = $"Order {order.Reference}", UnitAmount = order.TotalMinor, Currency = "sek" }],
+///       SuccessUrl = $"https://acme.test/orders/{order.Reference}/thanks",
+///       CancelUrl   = $"https://acme.test/orders/{order.Reference}",
+///       Metadata    = new Dictionary<string, string> { { "order_id", order.Reference } },
+///     }, order.Reference);
+///     return session.Url ?? "";
+///   }
+///
+/// ⭐ ONE FACTORY, AND IT COMPILES (BL-14, 2026-09-27). The compiler notes that the credential field was assigned a
+/// secret, so the object may be returned and passed between your functions while the FIELD cannot be read back out —
+/// returned, logged, stored, copied or sent to a page. A component holding the client is refused (an object reaches the
+/// browser with its fields), and so is invoking the factory from a request.
+///
+/// ⛔ IT RUNS SERVER-SIDE BY CONSTRUCTION, like every outbound call: the server holds the secret key and the browser
+///    must never see it. A `sk_…` key that reaches a page is a key that can issue refunds to anyone's card.
+///
+/// ⚠ A NON-2xx RESPONSE THROWS; A DECLINED CARD USUALLY DOES NOT. Those are different events and conflating them is
+///   the classic payments bug. Transport and configuration faults raise `ExternalServiceException`; a card the issuer
+///   refused comes back 200 with `Status = "requires_payment_method"`. Read `Status`.
+public class StripeClient {
+  /// The secret key. Declared where the client is built, so the app names its own secret:
+  /// `new StripeClient { ApiKey = Secret.StripeApiKey }`. A `sk_test_…` key reaches test mode and a `sk_live_…` key
+  /// reaches production — there is no flag here, the KEY is the switch.
+  public string ApiKey = "";
+
+  /// The API root. Stripe's own unless you are pointed at a local mock (`stripe-mock`) or a gateway.
+  public string BaseUrl = "https://api.stripe.com";
+
+  /// The API version this app expects, as `Stripe-Version` — e.g. `"2025-08-27.basil"`.
+  ///
+  /// ⚑ EMPTY MEANS YOUR ACCOUNT'S DEFAULT, which is the honest default for a kit but NOT what you want in
+  ///   production. Stripe moves an account's default version when you upgrade in the dashboard, and that changes
+  ///   response shapes under a running app with no deploy on your side. Pin it once you are live, and change it
+  ///   deliberately. This kit reads only long-stable fields, so it does not pin one on your behalf — a version
+  ///   string invented here would be a guess that failed every call.
+  public string ApiVersion = "";
+
+  // ── payment intents ───────────────────────────────────────────────────────────────────────────────────────────
+
+  /// Create a payment intent. Answers it with its `ClientSecret`, which is what a browser card form needs.
+  ///
+  /// `idempotencyKey` is what stops a double charge, and for money it is not optional in spirit. Stripe replays the
+  /// first answer for 24 hours per key, so a handler that runs twice — a redelivered event, a retried workflow step,
+  /// a customer double-clicking — creates ONE payment. Pass something derived from what the payment is ABOUT (an
+  /// order reference), never a timestamp or a random value, or every retry is a fresh charge.
+  public StripePaymentIntent CreatePaymentIntent(PaymentIntentRequest request, string? idempotencyKey = null) {
+    if (request.Amount <= 0) {
+      throw new ExternalServiceException($"A payment intent needs a positive amount in minor units; this one has {request.Amount}. 20.00 SEK is `Amount = 2000`, not 20.");
+    }
+    if (request.Currency == "") {
+      throw new ExternalServiceException("A payment intent needs a currency: set `Currency` to an ISO 4217 code such as \"sek\".");
+    }
+
+    var form = new FormBody();
+    form.AddLong("amount", request.Amount);
+    form.Add("currency", request.Currency);
+    form.AddOptional("customer", request.Customer);
+    form.AddOptional("description", request.Description);
+    form.AddOptional("receipt_email", request.ReceiptEmail);
+    if (request.CaptureLater) { form.Add("capture_method", "manual"); }
+    form.AddOptional("payment_method", request.PaymentMethod);
+    if (request.OffSession) {
+      form.AddBool("off_session", true);
+      form.AddBool("confirm", true);
+    }
+    if (request.PaymentMethodTypes.Count > 0) {
+      form.AddList("payment_method_types", request.PaymentMethodTypes);
+    } else if (request.OffSession) {
+      // Nobody is there to be redirected to a bank's page, so only a way to pay that needs no redirect is tried.
+      form.AddBool("automatic_payment_methods[enabled]", true);
+      form.Add("automatic_payment_methods[allow_redirects]", "never");
+    } else {
+      // Nothing named means "whatever this account and this customer support" — the setting that makes a new
+      // payment method appear without a code change. It is mutually exclusive with `payment_method_types`.
+      form.AddBool("automatic_payment_methods[enabled]", true);
+    }
+    form.AddMap("metadata", request.Metadata);
+
+    return JsonSerializer.Deserialize<StripePaymentIntent>(Post("/v1/payment_intents", form, idempotencyKey));
+  }
+
+  /// Read one back — the honest way to learn whether a payment succeeded when you have not wired webhooks yet.
+  public StripePaymentIntent GetPaymentIntent(string intentId) {
+    return JsonSerializer.Deserialize<StripePaymentIntent>(Get("/v1/payment_intents/" + Uri.EscapeDataString(intentId)));
+  }
+
+  /// Take the money on an intent created with `CaptureLater`. `amountMinor` of 0 captures the full authorized
+  /// amount, which is the common case; a smaller amount captures part and releases the rest.
+  public StripePaymentIntent CapturePaymentIntent(string intentId, long amountMinor = 0, string? idempotencyKey = null) {
+    var form = new FormBody();
+    if (amountMinor > 0) { form.AddLong("amount_to_capture", amountMinor); }
+    return JsonSerializer.Deserialize<StripePaymentIntent>(
+      Post("/v1/payment_intents/" + Uri.EscapeDataString(intentId) + "/capture", form, idempotencyKey));
+  }
+
+  /// Abandon an intent that will not be paid, releasing any authorization hold on the customer's card. Worth doing
+  /// explicitly rather than letting it expire: the hold is real money the customer cannot spend meanwhile.
+  public StripePaymentIntent CancelPaymentIntent(string intentId, string? idempotencyKey = null) {
+    return JsonSerializer.Deserialize<StripePaymentIntent>(
+      Post("/v1/payment_intents/" + Uri.EscapeDataString(intentId) + "/cancel", new FormBody(), idempotencyKey));
+  }
+
+  // ── terminal readers (server-driven) ──────────────────────────────────────────────────────────────────────────
+  //
+  // A smart reader (Stripe Reader S700, BBPOS WisePOS E) is driven from the server: a `card_present` payment intent is
+  // handed to the reader, which asks the customer for the card and authorises it. How it went is read back from the
+  // intent and the reader — https://docs.stripe.com/terminal/payments/collect-card-payment?terminal-sdk-platform=server-driven
+
+  /// Hand payment intent `intentId` to reader `readerId`, which asks the customer to tap, insert or swipe the card.
+  /// Answers the reader, whose action is usually still `in_progress`.
+  public StripeReader ProcessOnReader(string readerId, string intentId, string? idempotencyKey = null) {
+    var form = new FormBody();
+    form.Add("payment_intent", intentId);
+    return JsonSerializer.Deserialize<StripeReader>(
+      Post("/v1/terminal/readers/" + Uri.EscapeDataString(readerId) + "/process_payment_intent", form, idempotencyKey));
+  }
+
+  /// Read a reader back — its last action and how that stands.
+  public StripeReader GetReader(string readerId) {
+    return JsonSerializer.Deserialize<StripeReader>(Get("/v1/terminal/readers/" + Uri.EscapeDataString(readerId)));
+  }
+
+  /// Stop what the reader is waiting for (a payment the customer has not presented a card for). One mid-authorisation
+  /// cannot be stopped — Stripe answers `terminal_reader_busy`.
+  public StripeReader CancelReaderAction(string readerId) {
+    return JsonSerializer.Deserialize<StripeReader>(
+      Post("/v1/terminal/readers/" + Uri.EscapeDataString(readerId) + "/cancel_action", new FormBody(), null));
+  }
+
+  /// TEST MODE ONLY: a simulated reader (`registration_code` `simulated-wpe`) is shown a test card, as a customer would
+  /// tap one — https://docs.stripe.com/terminal/references/testing#simulated-card-presentment. Live mode refuses it.
+  public StripeReader PresentTestCard(string readerId) {
+    return JsonSerializer.Deserialize<StripeReader>(
+      Post("/v1/test_helpers/terminal/readers/" + Uri.EscapeDataString(readerId) + "/present_payment_method", new FormBody(), null));
+  }
+
+  // ── hosted checkout ───────────────────────────────────────────────────────────────────────────────────────────
+
+  /// Create a hosted Checkout session and answer it; send the customer to its `Url`.
+  public StripeCheckoutSession CreateCheckoutSession(CheckoutSessionRequest request, string? idempotencyKey = null) {
+    if (request.LineItems.Count == 0) {
+      throw new ExternalServiceException("A checkout session needs at least one line item: set `LineItems`.");
+    }
+    if (request.SuccessUrl == "" || request.CancelUrl == "") {
+      throw new ExternalServiceException("A checkout session needs both `SuccessUrl` and `CancelUrl` — Stripe has nowhere to send the customer back to otherwise.");
+    }
+    if (request.CustomerEmail != null && request.Customer != null) {
+      throw new ExternalServiceException("Set `Customer` or `CustomerEmail`, not both — Stripe refuses a session that names an existing customer AND an email, because it cannot tell which identity you meant.");
+    }
+
+    var form = new FormBody();
+    form.Add("mode", request.Mode);
+    form.Add("success_url", request.SuccessUrl);
+    form.Add("cancel_url", request.CancelUrl);
+    form.AddOptional("customer", request.Customer);
+    form.AddOptional("customer_email", request.CustomerEmail);
+    form.AddOptional("client_reference_id", request.ClientReferenceId);
+    if (request.SaveForLater && request.Mode == "payment") {
+      form.Add("payment_intent_data[setup_future_usage]", "off_session");
+      if (request.Customer == null) { form.Add("customer_creation", "always"); }
+    }
+    if (request.ManagedPayments != null) { form.Add("managed_payments[enabled]", request.ManagedPayments == true ? "true" : "false"); }
+
+    for (var i = 0; i < request.LineItems.Count; i = i + 1) {
+      var item = request.LineItems[i];
+      var at = "line_items[" + Convert.ToString(i) + "]";
+      form.AddLong(at + "[quantity]", item.Quantity);
+
+      if (item.Price != null && item.Price != "") {
+        if (item.ProductName != null || item.UnitAmount > 0) {
+          throw new ExternalServiceException($"Line {i} names a catalogue price AND an inline one. Set `Price`, or set `ProductName` + `UnitAmount` — Stripe takes one or the other.");
+        }
+        form.Add(at + "[price]", item.Price);
+      } else {
+        if (item.ProductName == null || item.ProductName == "") {
+          throw new ExternalServiceException($"Line {i} has no `Price` and no `ProductName`. An inline line needs a name the customer will read on the payment page.");
+        }
+        if (item.UnitAmount <= 0) {
+          throw new ExternalServiceException($"Line {i} ('{item.ProductName}') has no amount. `UnitAmount` is minor units — 20.00 is 2000.");
+        }
+        var currency = item.Currency != "" ? item.Currency : "";
+        if (currency == "") {
+          throw new ExternalServiceException($"Line {i} ('{item.ProductName}') has no currency. An inline line carries its own: set `Currency` to an ISO 4217 code such as \"sek\".");
+        }
+        form.Add(at + "[price_data][currency]", currency);
+        form.AddLong(at + "[price_data][unit_amount]", item.UnitAmount);
+        form.Add(at + "[price_data][product_data][name]", item.ProductName);
+      }
+    }
+
+    for (var c = 0; c < request.Coupons.Count; c = c + 1) {
+      form.Add("discounts[" + Convert.ToString(c) + "][coupon]", request.Coupons[c]);
+    }
+    form.AddMap("metadata", request.Metadata);
+    return JsonSerializer.Deserialize<StripeCheckoutSession>(Post("/v1/checkout/sessions", form, idempotencyKey));
+  }
+
+  /// Read a session back — what the `success_url` page should do before it says "thank you", and what a webhook
+  /// handler does to re-read the truth rather than trusting a payload it was handed.
+  public StripeCheckoutSession GetCheckoutSession(string sessionId) {
+    return JsonSerializer.Deserialize<StripeCheckoutSession>(Get("/v1/checkout/sessions/" + Uri.EscapeDataString(sessionId)));
+  }
+
+  /// A coupon worth `amountOffMinor` in `currency`, used once — a discount the shop worked out itself, handed to a
+  /// checkout session through `CheckoutSessionRequest.Coupons`. `name` is what the payment page shows beside it.
+  public StripeCoupon CreateCoupon(long amountOffMinor, string currency, string name, string? idempotencyKey = null) {
+    if (amountOffMinor <= 0) { throw new ExternalServiceException("A coupon needs an amount off: `amountOffMinor` is minor units — 20.00 is 2000."); }
+    var form = new FormBody();
+    form.AddLong("amount_off", amountOffMinor);
+    form.Add("currency", currency.ToLower());
+    form.Add("duration", "once");
+    form.Add("name", name.Length > 40 ? name.Substring(0, 40) : name);
+    return JsonSerializer.Deserialize<StripeCoupon>(Post("/v1/coupons", form, idempotencyKey));
+  }
+
+  // ── payouts ─────────────────────────────────────────────────────────────────────────────────────────────────────
+
+  /// Every payout arriving between `from` and `to`, oldest first — each page followed.
+  public List<StripePayout> ListPayouts(DateTime from, DateTime to) {
+    List<StripePayout> all = [];
+    var after = "";
+    while (true) {
+      var path = "/v1/payouts?limit=100&arrival_date[gte]=" + Convert.ToString(UnixSeconds(from))
+        + "&arrival_date[lte]=" + Convert.ToString(UnixSeconds(to))
+        + (after == "" ? "" : "&starting_after=" + Uri.EscapeDataString(after));
+      var page = JsonSerializer.Deserialize<StripePayoutList>(Get(path));
+      all.AddRange(page.Data);
+      if (!page.HasMore || page.Data.Count == 0) { break; }
+      after = page.Data.Last().PayoutId ?? "";
+    }
+    return all.OrderBy(p => p.ArrivalDate).ToList();
+  }
+
+  long UnixSeconds(DateTime at) { return (long)(at - new DateTime(1970, 1, 1)).TotalSeconds; }
+
+  /// The balance transactions one payout settles, each with its source expanded — every page followed.
+  public List<StripeBalanceTransaction> PayoutTransactions(string payoutId) {
+    List<StripeBalanceTransaction> all = [];
+    var after = "";
+    while (true) {
+      var path = "/v1/balance_transactions?limit=100&payout=" + Uri.EscapeDataString(payoutId) + "&expand[]=data.source"
+        + (after == "" ? "" : "&starting_after=" + Uri.EscapeDataString(after));
+      var page = JsonSerializer.Deserialize<StripeBalanceTransactionList>(Get(path));
+      all.AddRange(page.Data);
+      if (!page.HasMore || page.Data.Count == 0) { break; }
+      after = page.Data.Last().TransactionId ?? "";
+    }
+    return all;
+  }
+
+  // ── kept ways to pay ──────────────────────────────────────────────────────────────────────────────────────────
+
+  public StripePaymentMethod GetPaymentMethod(string methodId) {
+    return JsonSerializer.Deserialize<StripePaymentMethod>(Get("/v1/payment_methods/" + Uri.EscapeDataString(methodId)));
+  }
+
+  /// Stop keeping a way to pay on its customer — it can no longer be charged.
+  public StripePaymentMethod DetachPaymentMethod(string methodId) {
+    return JsonSerializer.Deserialize<StripePaymentMethod>(
+      Post("/v1/payment_methods/" + Uri.EscapeDataString(methodId) + "/detach", new FormBody(), null));
+  }
+
+  // ── customers and refunds ─────────────────────────────────────────────────────────────────────────────────────
+
+  /// Create a customer, so a second payment does not ask for the card again. Store the `CustomerId` on your own
+  /// user row — it is the handle everything else hangs off.
+  public StripeCustomer CreateCustomer(string email, string? name = null, string? idempotencyKey = null) {
+    var form = new FormBody();
+    form.Add("email", email);
+    form.AddOptional("name", name);
+    return JsonSerializer.Deserialize<StripeCustomer>(Post("/v1/customers", form, idempotencyKey));
+  }
+
+  /// Refund a payment. `amountMinor` of 0 refunds the whole thing, which is the common case.
+  ///
+  /// `reason` is one of `duplicate`, `fraudulent`, `requested_by_customer`. It is optional to Stripe and worth
+  /// setting anyway: `fraudulent` feeds their risk model, and the other two are how your own dashboard stays
+  /// readable a year later.
+  public StripeRefund CreateRefund(string paymentIntentId, long amountMinor = 0, string? reason = null,
+                                   string? idempotencyKey = null) {
+    var form = new FormBody();
+    form.Add("payment_intent", paymentIntentId);
+    if (amountMinor > 0) { form.AddLong("amount", amountMinor); }
+    form.AddOptional("reason", reason);
+    return JsonSerializer.Deserialize<StripeRefund>(Post("/v1/refunds", form, idempotencyKey));
+  }
+
+  // ── the wire ──────────────────────────────────────────────────────────────────────────────────────────────────
+
+  string Post(string path, FormBody form, string? idempotencyKey) {
+    var r = Http.Post(BaseUrl + path, form.Encode(), "application/x-www-form-urlencoded", Headers(idempotencyKey));
+    if (!r.IsSuccess) { throw new ExternalServiceException(Failure(path, r)); }
+    return r.Body;
+  }
+
+  string Get(string path) {
+    var r = Http.Get(BaseUrl + path, Headers(null));
+    if (!r.IsSuccess) { throw new ExternalServiceException(Failure(path, r)); }
+    return r.Body;
+  }
+
+  Dictionary<string, string> Headers(string? idempotencyKey) {
+    var headers = new Dictionary<string, string>();
+    headers.Add("Authorization", "Bearer " + ApiKey);
+    if (ApiVersion != "") { headers.Add("Stripe-Version", ApiVersion); }
+    if (idempotencyKey != null) { headers.Add("Idempotency-Key", idempotencyKey); }
+    return headers;
+  }
+
+  /// What went wrong, in Stripe's own words and with everything it told us.
+  ///
+  /// ⚑ `decline_code` IS THE FIELD THAT ANSWERS THE SUPPORT CALL. "Your card was declined" is what the customer
+  ///   sees; `insufficient_funds` versus `lost_card` versus `do_not_honor` is what tells you whether to suggest
+  ///   another card or stop asking. Dropping it would make every decline look the same in your logs.
+  string Failure(string path, HttpResponse r) {
+    var detail = r.Body;
+    if (r.Body != "") {
+      var envelope = JsonSerializer.Deserialize<StripeErrorEnvelope>(r.Body);
+      var error = envelope.Error;
+      if (error != null && error.Message != null) {
+        detail = error.Message;
+        if (error.Code != null) { detail = error.Code + ": " + detail; }
+        if (error.Type != null) { detail = error.Type + " " + detail; }
+        if (error.DeclineCode != null) { detail = detail + " (issuer said: " + error.DeclineCode + ")"; }
+        if (error.Param != null) { detail = detail + " [parameter: " + error.Param + "]"; }
+        if (error.RequestLogUrl != null) { detail = detail + " — in your dashboard: " + error.RequestLogUrl; }
+      }
+    }
+    return "Stripe " + path + " answered " + Convert.ToString(r.StatusCode) + ": " + detail;
+  }
+}

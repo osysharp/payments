@@ -1,0 +1,36 @@
+{
+  "platform": {
+    "version": "0.9.0"
+  },
+  "entries": [
+    {
+      "name": "Osysharp.Http",
+      "kind": "package",
+      "version": "1.0.0",
+      "hash": "sha256:4c24068aeea5ef1a155459d4cc332c85d7ee3d96049f2404e54ac860d94beb0f",
+      "minPlatform": "0.9.0",
+      "shadow": "app-forkable",
+      "source": "workspace:Platform.Core/Dsl/OsySharp/Baseline/Capabilities/Http"
+    },
+    {
+      "name": "Osysharp.Payments",
+      "kind": "package",
+      "version": "0.1.0",
+      "hash": "sha256:24c25dc952d65c184b67b1c80f75ee1825e8e4fd6d5417c5e477fa77b5d8fd87",
+      "minPlatform": "0.9.0",
+      "shadow": "app-forkable",
+      "source": "workspace:kits/payments",
+      "constraint": "0"
+    },
+    {
+      "name": "Osysharp.Payments.Stripe",
+      "kind": "package",
+      "version": "0.1.0",
+      "hash": "sha256:f35f733b85ff6192d92058a7b72a7e3660753b04a10ef46c9db5c29727448c50",
+      "minPlatform": "0.9.0",
+      "shadow": "app-forkable",
+      "source": "workspace:kits/stripe",
+      "constraint": "0"
+    }
+  ]
+}

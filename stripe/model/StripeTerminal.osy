@@ -1,0 +1,96 @@
+namespace Osysharp.Payments.Stripe;
+
+using Osysharp.Payments;
+
+/// A card taken on a Stripe Terminal smart reader at a shop's counter — the `Osysharp.Payments` counter contract
+/// (`ICounterPayment`), driven from the server (no SDK on the counter's screen). List it in the app's counter payments
+/// beside the `StripePayments` that refunds it:
+///
+///     new StripeTerminal { ApiKey = Secret.StripeApiKey, ReaderId = "tmr_…", Currencies = ["SEK"] }
+///
+/// ⭐ THE MONEY IS STRIPE'S LIKE ANY CARD PAYMENT: the payment intent it makes (`card_present`, captured at once) is
+///    refunded by `StripePayments.Refund` (`RefundsThrough` "stripe") and paid out and reconciled with the web's.
+///
+/// ⛔ ONLY STRIPE SAYS IT IS PAID. `CheckAtCounter` reads the intent back with the shop's key and answers Paid only for
+///    an intent that succeeded, carries THIS reference in its metadata, and is for THIS amount — so an intent id from
+///    another sale, or typed in, pays nothing here.
+///
+/// ⚑ A READER TAKES ITS ACCOUNT'S LOCAL CURRENCY ONLY (Stripe: the account and the reader's location must be in the same
+///   country), so `Currencies` says which — a Swedish account's reader takes kronor.
+///
+/// Test without hardware: register a simulated reader (registration code `simulated-wpe`) with a `sk_test_…` key and
+/// call `PresentTestCard` where a customer would tap — https://docs.stripe.com/terminal/references/testing.
+public class StripeTerminal : ICounterPayment {
+  public string Key { get; set; } = "stripe-terminal";
+  public string Label { get; set; } = "Card on the reader";
+  /// The online provider whose `Refund` gives it back — the app's `StripePayments` key.
+  public string RefundsThrough { get; set; } = "stripe";
+  /// The secret key — the same account as the app's `StripePayments`.
+  public string ApiKey = "";
+  /// The reader at this counter, `tmr_…`.
+  public string ReaderId = "";
+  /// The currencies it takes (ISO 4217) — the account's own. Empty: whatever it is asked for.
+  public List<string> Currencies = [];
+  public string BaseUrl = "https://api.stripe.com";
+
+  public StripeClient Client() { return new StripeClient { ApiKey = ApiKey, BaseUrl = BaseUrl }; }
+
+  public bool IsReady() { return ApiKey != "" && ReaderId != ""; }
+
+  public string CounterCurrencyRefusal(string currency) {
+    if (Currencies.Count == 0 || Currencies.Any(c => c.ToUpper() == currency.ToUpper())) { return ""; }
+    return $"The card reader takes {string.Join(" and ", Currencies)} only, and this is priced in {currency}.";
+  }
+
+  /// A `card_present` payment intent for the request, captured as soon as the card is authorised, handed to the reader.
+  /// Keyed on the request's `IdempotencyKey`: a second press — or asking again after a declined card — uses the SAME
+  /// intent (Stripe: "re-use the same PaymentIntent after a card is declined"), never a second charge.
+  public CounterPaymentStart StartAtCounter(PaymentRequest request) {
+    var refusal = CounterCurrencyRefusal(request.Currency);
+    if (refusal != "") { throw new ExternalServiceException(refusal); }
+    var client = Client();
+    var metadata = new Dictionary<string, string>();
+    metadata.Add("reference", request.Reference);
+    var intent = client.CreatePaymentIntent(new PaymentIntentRequest {
+      Amount = request.Amount, Currency = request.Currency.ToLower(), Description = request.Description,
+      PaymentMethodTypes = ["card_present"], Metadata = metadata,
+    }, "counter-" + (request.IdempotencyKey == "" ? request.Reference : request.IdempotencyKey));
+    var id = intent.IntentId ?? "";
+    if (intent.Status == "succeeded") { return new CounterPaymentStart { ProviderRef = id, Instructions = "It is already paid." }; }
+    client.ProcessOnReader(ReaderId, id);
+    return new CounterPaymentStart { ProviderRef = id, Instructions = "Tap, insert or swipe the card on the reader." };
+  }
+
+  /// How the intent stands: Paid once it succeeded (for this reference and amount); Failed when the reader says the
+  /// card was declined or the customer cancelled on it; Pending while the reader waits for the card.
+  public PaymentCheck CheckAtCounter(string reference, long amount, string providerRef) {
+    if (!providerRef.StartsWith("pi_")) { return new PaymentCheck { State = PaymentState.Failed, Message = "That is not a card payment from the reader." }; }
+    var client = Client();
+    var intent = client.GetPaymentIntent(providerRef);
+    var said = intent.Metadata == null || !intent.Metadata!.ContainsKey("reference") ? "" : intent.Metadata!["reference"];
+    if (said != reference || intent.Amount != amount) {
+      return new PaymentCheck { State = PaymentState.Failed, Message = "That card payment is not for this sale." };
+    }
+    if (intent.Status == "succeeded") { return new PaymentCheck { State = PaymentState.Paid, ProviderRef = providerRef }; }
+    if (intent.Status == "canceled") { return new PaymentCheck { State = PaymentState.Failed, ProviderRef = providerRef, Message = "The card payment was called off." }; }
+    // Still wanting a card: the reader says whether it is waiting for one or the last one failed.
+    var reader = client.GetReader(ReaderId);
+    var action = reader.Action;
+    if (action != null && action.Status == "failed" && action.ProcessPaymentIntent != null
+        && action.ProcessPaymentIntent.PaymentIntent == providerRef) {
+      return new PaymentCheck { State = PaymentState.Failed, ProviderRef = providerRef,
+                                Message = action.FailureMessage ?? "The card was not accepted." };
+    }
+    return new PaymentCheck { State = PaymentState.Pending, ProviderRef = providerRef, Message = "Waiting for the card on the reader." };
+  }
+
+  /// Stop the reader waiting for the card, and call the intent off — nothing was taken.
+  public void CancelAtCounter(string providerRef) {
+    var client = Client();
+    try { client.CancelReaderAction(ReaderId); } catch (ExternalServiceException ex) { Log.Warning($"The reader could not be reset: {ex.Message}"); }
+    if (providerRef.StartsWith("pi_")) { client.CancelPaymentIntent(providerRef); }
+  }
+
+  /// TEST MODE: a simulated reader is shown a test card, as a customer would tap one.
+  public void PresentTestCard() { Client().PresentTestCard(ReaderId); }
+}
