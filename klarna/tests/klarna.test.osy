@@ -1,0 +1,300 @@
+namespace KlarnaKitTests;
+
+using Osysharp.Http;
+using Osysharp.Payments.Klarna;
+
+// The kit's own tests. `osy publish` runs them and refuses a version that fails.
+//
+// ⭐ MOST OF THIS FILE IS ABOUT ARITHMETIC, and that is not padding. Klarna validates that every line's total is its
+//    unit price times its quantity, and that the order's amount is the sum of the lines — then refuses a mismatch with
+//    a message naming a FIELD rather than the sum. It is the single most common way a Klarna integration fails, so the
+//    kit computes all of it and these tests are what hold the computation.
+
+[Test]
+void a_session_posts_the_market_and_the_COMPUTED_total() {
+    var posted = new List<string>();
+    var urls = new List<string>();
+    Http.Post.Stub((url, body) => {
+        urls.Add(url);
+        posted.Add(body);
+        return new HttpResponse { StatusCode = 200, Body = "{\"session_id\":\"s-1\",\"client_token\":\"tok-1\"}" };
+    });
+
+    var session = OpenSession();
+
+    Assert.Equal("https://api.playground.klarna.com/payments/v1/sessions", urls[0]);
+    Assert.Contains("\"purchase_country\":\"SE\"", posted[0]);
+    Assert.Contains("\"purchase_currency\":\"SEK\"", posted[0]);
+    Assert.Contains("\"locale\":\"sv-SE\"", posted[0]);
+    Assert.Contains("\"intent\":\"buy\"", posted[0]);
+    // 2 × 12500 + 4900 = 29900. The caller never supplied this number.
+    Assert.Contains("\"order_amount\":29900", posted[0]);
+    Assert.Equal("tok-1", session.ClientToken);
+}
+
+[Test]
+void each_LINE_total_is_computed_so_a_caller_cannot_get_it_wrong() {
+    // ⛔ THE FIELD THAT IS NOT ON `BasketLine`. Klarna requires `total_amount = unit_price × quantity`, so a field the
+    //    caller could fill in wrongly is a field the kit should not offer. This asserts the computation, not a
+    //    round-trip of something handed in.
+    var posted = new List<string>();
+    Http.Post.Stub((url, body) => { posted.Add(body); return new HttpResponse { StatusCode = 200, Body = "{\"session_id\":\"s\"}" }; });
+
+    OpenSession();
+
+    Assert.Contains("\"unit_price\":12500", posted[0]);
+    Assert.Contains("\"quantity\":2", posted[0]);
+    Assert.Contains("\"total_amount\":25000", posted[0]);
+    Assert.Contains("\"reference\":\"SKU-1\"", posted[0]);
+}
+
+[Test]
+void tax_is_the_PORTION_of_an_inclusive_price_not_an_addition_to_it() {
+    // ⚑ KLARNA'S MODEL IS TAX-INCLUSIVE, and getting this backwards inflates every order by the tax. At 25% the tax
+    //   inside 25000 is 5000 — 25000 × 2500 ÷ 12500 — not 6250, which is what adding 25% would give.
+    var posted = new List<string>();
+    Http.Post.Stub((url, body) => { posted.Add(body); return new HttpResponse { StatusCode = 200, Body = "{\"session_id\":\"s\"}" }; });
+
+    OpenSession();
+
+    Assert.Contains("\"tax_rate\":2500", posted[0]);
+    Assert.Contains("\"total_tax_amount\":5000", posted[0]);   // the widgets: 25000 inc. 25%
+    Assert.Contains("\"total_tax_amount\":980", posted[0]);    // shipping: 4900 inc. 25%
+    // …and the order's tax is the sum of the lines', like its amount.
+    Assert.Contains("\"order_tax_amount\":5980", posted[0]);
+    Assert.DoesNotContain("6250", posted[0]);
+}
+
+[Test]
+void a_line_with_NO_tax_sends_zero_rather_than_omitting_it() {
+    var posted = new List<string>();
+    Http.Post.Stub((url, body) => { posted.Add(body); return new HttpResponse { StatusCode = 200, Body = "{\"session_id\":\"s\"}" }; });
+
+    OpenUntaxedSession();
+
+    Assert.Contains("\"order_amount\":30000", posted[0]);
+    Assert.Contains("\"tax_rate\":0", posted[0]);
+    Assert.Contains("\"total_tax_amount\":0", posted[0]);
+    Assert.Contains("\"order_tax_amount\":0", posted[0]);
+}
+
+// ── the refusals, all before the call ───────────────────────────────────────────────────────────────────────────
+
+[Test]
+void a_client_with_no_MARKET_is_refused_naming_all_three_fields() {
+    // ⚠ Klarna refuses a mismatch naming ONE field, which sends the reader to whichever of the three they looked at
+    //   first. This names all three and says they must agree.
+    var urls = new List<string>();
+    Http.Post.Stub((url, body) => { urls.Add(url); return new HttpResponse { StatusCode = 200, Body = "{}" }; });
+
+    var refusal = Assert.Throws<ExternalServiceException>(() => OpenMarketlessSession());
+
+    Assert.Equal(0, urls.Count);
+    Assert.Contains("PurchaseCountry", refusal.Message);
+    Assert.Contains("PurchaseCurrency", refusal.Message);
+    Assert.Contains("Locale", refusal.Message);
+    Assert.Contains("agree", refusal.Message);
+}
+
+[Test]
+void an_empty_basket_is_refused() {
+    var urls = new List<string>();
+    Http.Post.Stub((url, body) => { urls.Add(url); return new HttpResponse { StatusCode = 200, Body = "{}" }; });
+
+    var refusal = Assert.Throws<ExternalServiceException>(() => OpenEmptySession());
+
+    Assert.Equal(0, urls.Count);
+    Assert.Contains("at least one basket line", refusal.Message);
+}
+
+[Test]
+void a_nameless_line_is_refused_because_the_SHOPPER_reads_it() {
+    var refusal = Assert.Throws<ExternalServiceException>(() => OpenNamelessSession());
+    Assert.Contains("shows it to the shopper", refusal.Message);
+}
+
+[Test]
+void a_zero_quantity_line_is_refused_and_says_how_to_remove_a_line() {
+    var refusal = Assert.Throws<ExternalServiceException>(() => OpenZeroQuantitySession());
+    Assert.Contains("at least one", refusal.Message);
+    Assert.Contains("leave it out of the basket", refusal.Message);
+}
+
+[Test]
+void a_negative_price_is_refused_and_names_how_a_DISCOUNT_is_modelled() {
+    // ⚑ The natural thing to reach for, and wrong in Klarna's model: a discount is its own line with a negative
+    //   price, not a negative price on the thing being bought.
+    var refusal = Assert.Throws<ExternalServiceException>(() => OpenNegativeSession());
+    Assert.Contains("discount is its own line", refusal.Message);
+}
+
+// ── the order, and the money after it ───────────────────────────────────────────────────────────────────────────
+
+[Test]
+void creating_an_order_needs_the_BROWSERS_authorization_token() {
+    // ⛔ THE STEP THAT IS NOT YOURS. A flow trying to go from session straight to order has nothing to create it with,
+    //    and the refusal says where the token comes from rather than just refusing.
+    var urls = new List<string>();
+    Http.Post.Stub((url, body) => { urls.Add(url); return new HttpResponse { StatusCode = 200, Body = "{}" }; });
+
+    var refusal = Assert.Throws<ExternalServiceException>(() => PlaceOrderWithNoToken());
+
+    Assert.Equal(0, urls.Count);
+    Assert.Contains("happens in the browser", refusal.Message);
+}
+
+[Test]
+void an_order_posts_to_the_authorization_and_carries_the_basket_again() {
+    // ⚠ Klarna compares the basket with what the shopper authorized, so it has to be sent and has to still add up.
+    var posted = new List<string>();
+    var urls = new List<string>();
+    Http.Post.Stub((url, body) => {
+        urls.Add(url);
+        posted.Add(body);
+        return new HttpResponse { StatusCode = 200, Body = "{\"order_id\":\"ord-1\",\"fraud_status\":\"ACCEPTED\",\"redirect_url\":\"https://klarna.test/next\"}" };
+    });
+
+    var order = PlaceOrder("auth-tok-9");
+
+    Assert.Equal("https://api.playground.klarna.com/payments/v1/authorizations/auth-tok-9/order", urls[0]);
+    Assert.Contains("\"order_amount\":29900", posted[0]);
+    Assert.Equal("ord-1", order.OrderId);
+    Assert.Equal("ACCEPTED", order.FraudStatus);
+    Assert.Equal("https://klarna.test/next", order.RedirectUrl);
+}
+
+[Test]
+void a_full_capture_OMITS_the_amount_and_a_partial_one_names_it() {
+    // Sending `captured_amount: 0` would capture nothing and answer success — the customer unshipped and unbilled,
+    // with nothing anywhere saying so.
+    var posted = new List<string>();
+    var urls = new List<string>();
+    Http.Post.Stub((url, body) => {
+        urls.Add(url); posted.Add(body);
+        return new HttpResponse { StatusCode = 200, Body = "{\"capture_id\":\"cap-1\"}" };
+    });
+
+    CaptureAll("ord-1");
+    CapturePart("ord-1", 4900);
+
+    Assert.Equal("https://api.playground.klarna.com/ordermanagement/v1/orders/ord-1/captures", urls[0]);
+    Assert.DoesNotContain("captured_amount", posted[0]);
+    Assert.Contains("\"captured_amount\":4900", posted[1]);
+    Assert.Contains("Partial shipment", posted[1]);
+}
+
+[Test]
+void refund_and_cancel_are_different_endpoints_because_they_are_different_things() {
+    // ⚠ An order that was never captured is CANCELLED, not refunded — there is nothing to give back.
+    var urls = new List<string>();
+    Http.Post.Stub((url, body) => { urls.Add(url); return new HttpResponse { StatusCode = 200, Body = "{}" }; });
+
+    RefundAll("ord-1");
+    CancelOrder("ord-2");
+
+    Assert.Equal("https://api.playground.klarna.com/ordermanagement/v1/orders/ord-1/refunds", urls[0]);
+    Assert.Equal("https://api.playground.klarna.com/ordermanagement/v1/orders/ord-2/cancel", urls[1]);
+}
+
+[Test]
+void every_call_carries_BASIC_auth_and_no_other_credential() {
+    var auth = new List<string>();
+    Http.Post.Stub((url, body, headers) => {
+        auth.Add(headers["Authorization"]);
+        return new HttpResponse { StatusCode = 200, Body = "{\"session_id\":\"s\"}" };
+    });
+
+    OpenSession();
+
+    Assert.Equal("Basic " + Convert.ToBase64String(Text.ToBytes("k_test_user:k_test_pass")), auth[0]);
+}
+
+[Test]
+void a_refusal_carries_EVERY_message_and_the_correlation_id() {
+    // ⚑ `error_messages` is a LIST. A basket with three bad lines is refused once naming all three, and showing only
+    //   the first sends the reader round the loop twice. The correlation id is what Klarna's support asks for first.
+    Http.Post.Stub((url, body) => new HttpResponse {
+        StatusCode = 400,
+        Body = "{\"error_code\":\"BAD_VALUE\",\"error_messages\":[\"order_lines[0].total_amount\",\"order_amount\"],\"correlation_id\":\"corr-77\"}",
+    });
+
+    var refusal = Assert.Throws<ExternalServiceException>(() => OpenSession());
+
+    Assert.Contains("BAD_VALUE", refusal.Message);
+    Assert.Contains("order_lines[0].total_amount", refusal.Message);
+    Assert.Contains("order_amount", refusal.Message);
+    Assert.Contains("corr-77", refusal.Message);
+}
+
+[Test]
+void a_401_blames_the_ENVIRONMENT_before_the_password() {
+    // ⛔ THE COMMONEST SETUP MISTAKE. Credentials are per environment, so a 401 is usually playground keys against
+    //    live or the reverse — and nothing else in the stack will say so.
+    Http.Post.Stub((url, body) => new HttpResponse { StatusCode = 401, Body = "" });
+
+    var refusal = Assert.Throws<ExternalServiceException>(() => OpenSession());
+
+    Assert.Contains("401", refusal.Message);
+    Assert.Contains("ENVIRONMENT rather than the password", refusal.Message);
+    Assert.Contains("api.playground.klarna.com", refusal.Message);
+}
+
+[Test]
+void the_hosted_page_runs_over_the_session_and_asks_klarna_to_place_the_order() {
+    var posted = new List<string>();
+    var urls = new List<string>();
+    Http.Post.Stub((url, body) => {
+        urls.Add(url);
+        posted.Add(body);
+        return new HttpResponse { StatusCode = 200, Body = "{\"session_id\":\"h-1\",\"redirect_url\":\"https://pay.playground.klarna.com/eu/hpp/h-1\"}" };
+    });
+    var client = new KlarnaClient { Username = "u", Password = "p", BaseUrl = "https://api.playground.klarna.com",
+                                    PurchaseCountry = "SE", PurchaseCurrency = "SEK", Locale = "sv-SE" };
+    var page = client.CreateHostedPage("s-1", "https://shop.test/paid/A-1/klarna-{{order_id}}", "https://shop.test/paid/A-1/cancelled",
+                                       "https://shop.test/paid/A-1/failed");
+
+    Assert.Equal("https://api.playground.klarna.com/hpp/v1/sessions", urls[0]);
+    Assert.Contains("\"payment_session_url\":\"https://api.playground.klarna.com/payments/v1/sessions/s-1\"", posted[0]);
+    Assert.Contains("klarna-{{order_id}}", posted[0]);
+    Assert.Contains("\"place_order_mode\":\"PLACE_ORDER\"", posted[0]);
+    Assert.Equal("https://pay.playground.klarna.com/eu/hpp/h-1", page.RedirectUrl);
+}
+
+[Test]
+void a_session_carries_the_merchants_own_reference() {
+    var posted = new List<string>();
+    Http.Post.Stub((url, body) => { posted.Add(body); return new HttpResponse { StatusCode = 200, Body = "{\"session_id\":\"s-2\"}" }; });
+    var client = new KlarnaClient { Username = "u", Password = "p", PurchaseCountry = "SE", PurchaseCurrency = "SEK", Locale = "sv-SE" };
+    client.CreateSession([new BasketLine { Name = "Lamp", UnitPrice = 50000 }], "A-1041");
+    Assert.Contains("\"merchant_reference1\":\"A-1041\"", posted[0]);
+}
+
+[Test]
+void an_order_is_read_back_with_its_state_amount_and_reference() {
+    var urls = new List<string>();
+    Http.Get.Stub((url, headers) => {
+        urls.Add(url);
+        return new HttpResponse { StatusCode = 200, Body = "{\"order_id\":\"o-9\",\"status\":\"AUTHORIZED\",\"order_amount\":50000,\"merchant_reference1\":\"A-1041\"}" };
+    });
+    var client = new KlarnaClient { Username = "u", Password = "p" };
+    var order = client.GetOrder("o-9");
+    Assert.Equal("https://api.klarna.com/ordermanagement/v1/orders/o-9", urls[0]);
+    Assert.Equal("AUTHORIZED", order.Status);
+    Assert.Equal(50000, order.OrderAmount);
+    Assert.Equal("A-1041", order.MerchantReference);
+}
+
+[Test]
+void the_hosted_page_is_told_where_to_report_a_completed_session() {
+    var posted = new List<string>();
+    Http.Post.Stub((url, body) => { posted.Add(body); return new HttpResponse { StatusCode = 200, Body = "{\"session_id\":\"h-2\"}" }; });
+    var client = new KlarnaClient { Username = "u", Password = "p" };
+    client.CreateHostedPage("s-1", "https://shop.test/ok", "https://shop.test/no", "https://shop.test/no",
+                            true, "https://shop.test/klarna/events");
+    Assert.Contains("\"status_update\":\"https://shop.test/klarna/events\"", posted[0]);
+
+    var e = JsonSerializer.Deserialize<KlarnaHostedPageEvent>(
+      "{\"event_id\":\"e-1\",\"session\":{\"session_id\":\"h-2\",\"status\":\"COMPLETED\",\"order_id\":\"o-7\"}}");
+    Assert.Equal("COMPLETED", e.Session?.Status);
+    Assert.Equal("o-7", e.Session?.OrderId);
+}

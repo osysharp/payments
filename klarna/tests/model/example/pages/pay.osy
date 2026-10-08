@@ -1,0 +1,25 @@
+// The page: one button. The price is set on the server, the session is opened there, and the shopper
+// leaves for Klarna's page in this tab. Nothing about money passes through the browser.
+namespace ShopExample;
+
+[Page("/pay/{reference}")]
+[AllowAnonymous]
+component Pay(string reference) {
+  string problem = "";
+
+  action PayWithKlarna() {
+    try {
+      Navigation.Open(StartCheckout(reference), sameTab: true);
+    } catch (Exception ex) {
+      problem = ex.Message;
+    }
+  }
+
+  render {
+    Stack(gap: 3, maxW: "420px") {
+      Text($"Order {reference}", fontSize: FontSize.Subhead);
+      Button("Pay with Klarna", onPress: PayWithKlarna, tone: Tone.Primary);
+      if (problem != "") { Text(problem, color: Colors.TextSecondary); }
+    }
+  }
+}

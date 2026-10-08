@@ -1,0 +1,46 @@
+// EXAMPLE — the smallest working shape of Klarna in an app. This folder is shown on osyrin.com/integrations/ and
+// compiles with the kit's own test app, so it cannot drift from the kit. Three files, as an app would have them:
+// this one (the client and the server calls), pages/pay.osy (the button) and api/events.osy (the callback).
+namespace ShopExample;
+using Osysharp.Payments.Klarna;
+
+// Settings → API credentials in Klarna's merchant portal. Playground and live are separate pairs.
+app.Secrets = [ new Secret("KlarnaUsername"), new Secret("KlarnaPassword") ];
+
+/// One factory, credentials and all. It compiles because nothing can read Username or Password
+/// back out of what it returns; a page or a request cannot receive the client at all.
+KlarnaClient Klarna() {
+  return new KlarnaClient {
+    Username = Secret.KlarnaUsername, Password = Secret.KlarnaPassword,
+    BaseUrl = "https://api.playground.klarna.com",   // api.klarna.com when live
+    PurchaseCountry = "SE", PurchaseCurrency = "SEK", Locale = "sv-SE",
+  };
+}
+
+/// Your order's lines, priced HERE — never from the page. Amounts are minor units; 2500 is 25% VAT.
+List<BasketLine> Lines(string reference) {
+  return [ new BasketLine { Name = "Order " + reference, Quantity = 1, UnitPrice = 25000, TaxRate = 2500 } ];
+}
+
+/// 1. Open a session over the basket and answer Klarna's page for the shopper to go to.
+///    Klarna fills {{order_id}} into the success address on the way back. [AllowAnonymous] because a
+///    shopper is not signed in — and the compiler refuses a public page that calls a function that is not.
+[AllowAnonymous] string StartCheckout(string reference) {
+  var session = Klarna().CreateSession(Lines(reference), reference);
+  var page = Klarna().CreateHostedPage(session.SessionId ?? "",
+    $"{App.BaseUrl}/paid/{reference}/{{{{order_id}}}}",
+    $"{App.BaseUrl}/bag", $"{App.BaseUrl}/bag",
+    true, $"{App.BaseUrl}/api/klarna/events");
+  return page.RedirectUrl ?? "";
+}
+
+/// 2. Back from Klarna. An order id in a URL is a CLAIM — anybody can type one — so read the order
+///    back and check it is yours, for the amount you expect, before marking anything paid.
+bool Paid(string reference, long amountMinor, string klarnaOrderId) {
+  var theirs = Klarna().GetOrder(klarnaOrderId);
+  return theirs.MerchantReference == reference && theirs.OrderAmount == amountMinor
+      && theirs.FraudStatus == "ACCEPTED";
+}
+
+/// 4. On dispatch. The order is not the money: Capture charges the shopper.
+void Ship(string klarnaOrderId) { Klarna().Capture(klarnaOrderId); }

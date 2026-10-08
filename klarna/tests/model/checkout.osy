@@ -1,0 +1,48 @@
+namespace KlarnaKitTests;
+
+using Osysharp.Payments.Klarna;
+
+// Thin by design: the KIT is under test.
+
+// The playground client the tests share, named for what it is; `Klarna()` is the app-shaped factory in example.osy.
+KlarnaClient Playground() {
+  return new KlarnaClient {
+    Username = "k_test_user", Password = "k_test_pass",
+    BaseUrl = "https://api.playground.klarna.com",
+    PurchaseCountry = "SE", PurchaseCurrency = "SEK", Locale = "sv-SE",
+  };
+}
+
+List<BasketLine> TwoWidgets() {
+  return [
+    new BasketLine { Name = "Widget", Quantity = 2, UnitPrice = 12500, Reference = "SKU-1", TaxRate = 2500 },
+    new BasketLine { Name = "Shipping", Quantity = 1, UnitPrice = 4900, TaxRate = 2500 },
+  ];
+}
+
+KlarnaSession OpenSession() { return Playground().CreateSession(TwoWidgets()); }
+KlarnaSession OpenEmptySession() { return Playground().CreateSession([]); }
+KlarnaSession OpenUntaxedSession() {
+  return Playground().CreateSession([new BasketLine { Name = "Book", Quantity = 3, UnitPrice = 10000 }]);
+}
+KlarnaSession OpenNamelessSession() {
+  return Playground().CreateSession([new BasketLine { Name = "", Quantity = 1, UnitPrice = 100 }]);
+}
+KlarnaSession OpenZeroQuantitySession() {
+  return Playground().CreateSession([new BasketLine { Name = "Widget", Quantity = 0, UnitPrice = 100 }]);
+}
+KlarnaSession OpenNegativeSession() {
+  return Playground().CreateSession([new BasketLine { Name = "Widget", Quantity = 1, UnitPrice = -100 }]);
+}
+KlarnaSession OpenMarketlessSession() {
+  return new KlarnaClient { Username = "u", Password = "p" }
+    .CreateSession([new BasketLine { Name = "Widget", Quantity = 1, UnitPrice = 100 }]);
+}
+
+KlarnaOrder PlaceOrder(string token) { return Playground().CreateOrder(token, TwoWidgets()); }
+KlarnaOrder PlaceOrderWithNoToken() { return Playground().CreateOrder("", TwoWidgets()); }
+
+KlarnaCapture CaptureAll(string orderId) { return Playground().Capture(orderId); }
+KlarnaCapture CapturePart(string orderId, long minor) { return Playground().Capture(orderId, minor, "Partial shipment"); }
+void RefundAll(string orderId) { Playground().Refund(orderId); }
+void CancelOrder(string orderId) { Playground().Cancel(orderId); }

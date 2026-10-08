@@ -1,0 +1,279 @@
+using Osysharp.Http;
+using Osysharp.Payments.Klarna;
+using Osysharp.Payments;
+
+// KlarnaPayments under the payments contract — every Klarna call stubbed.
+
+KlarnaPayments Provider() {
+  return new KlarnaPayments { Username = "u", Password = "p", Playground = true, Country = "SE", Locale = "sv-SE" };
+}
+
+HttpResponse KlarnaOrder(string reference, long amount, string status, string fraud) {
+  return new HttpResponse { StatusCode = 200,
+    Body = "{\"order_id\":\"k-1\",\"status\":\"" + status + "\",\"fraud_status\":\"" + fraud + "\",\"order_amount\":"
+      + Convert.ToString(amount) + ",\"merchant_reference1\":\"" + reference + "\"}" };
+}
+
+[Test]
+void starting_puts_the_session_on_klarnas_hosted_page_with_the_order_id_in_the_return_address() {
+  var urls = new List<string>();
+  var posted = new List<string>();
+  Http.Post.Stub((url, body) => {
+    urls.Add(url); posted.Add(body);
+    return new HttpResponse { StatusCode = 200, Body = "{\"session_id\":\"s-1\",\"redirect_url\":\"https://pay.playground.klarna.com/h-1\"}" };
+  });
+  var start = Provider().Start(new PaymentRequest {
+    Reference = "RC-1", Currency = "SEK", Amount = 29000, Description = "Shop — order RC-1",
+    Lines = [new PaymentLine { Name = "Lamp", UnitPrice = 29000 }],
+    ReturnUrl = "https://shop.test/paid/RC-1/klarna-{token}", CancelUrl = "https://shop.test/bag",
+    EventsUrl = "https://shop.test/payments/klarna/events",
+  });
+  Assert.Equal("https://pay.playground.klarna.com/h-1", start.RedirectUrl);
+  Assert.Equal("https://api.playground.klarna.com/payments/v1/sessions", urls[0]);
+  Assert.Contains("\"merchant_reference1\":\"RC-1\"", posted[0]);
+  Assert.Contains("klarna-{{order_id}}", posted[1]);
+  Assert.Contains("\"status_update\":\"https://shop.test/payments/klarna/events\"", posted[1]);
+}
+
+[Test]
+void a_discount_is_its_own_negative_line_of_type_discount() {
+  var posted = new List<string>();
+  Http.Post.Stub((url, body) => {
+    posted.Add(body);
+    return new HttpResponse { StatusCode = 200, Body = "{\"session_id\":\"s-2\",\"redirect_url\":\"https://pay.playground.klarna.com/h-2\"}" };
+  });
+  Provider().Start(new PaymentRequest {
+    Reference = "RC-2", Currency = "SEK", Amount = 26100, Description = "Shop — order RC-2",
+    Lines = [new PaymentLine { Name = "Lamp", UnitPrice = 29000, TaxRate = 2500 },
+             new PaymentLine { Name = "PROMO10 — 10% off", UnitPrice = -2900, TaxRate = 2500 }],
+    ReturnUrl = "https://shop.test/paid/RC-2/klarna-{token}", CancelUrl = "https://shop.test/bag",
+  });
+  Assert.Contains("{\"type\":\"discount\",\"name\":", posted[0]);   // the name's dash travels JSON-escaped
+  Assert.Contains("\"unit_price\":-2900", posted[0]);
+  Assert.Contains("\"order_amount\":26100", posted[0]);
+}
+
+[Test]
+void an_order_is_authorised_only_for_this_reference_this_amount_and_a_passed_fraud_check() {
+  Http.Get.Stub((url, headers) => KlarnaOrder("RC-1", 29000, "AUTHORIZED", "ACCEPTED"));
+  Assert.Equal(PaymentState.Authorized, Provider().Check("RC-1", 29000, "k-1").State);
+  Assert.Equal(PaymentState.NotPaid, Provider().Check("RC-2", 29000, "k-1").State);
+  Assert.Equal(PaymentState.NotPaid, Provider().Check("RC-1", 100, "k-1").State);
+  Http.Get.Stub((url, headers) => KlarnaOrder("RC-1", 29000, "AUTHORIZED", "PENDING"));
+  Assert.Equal(PaymentState.Pending, Provider().Check("RC-1", 29000, "k-1").State);
+}
+
+[Test]
+void a_callback_is_believed_only_as_far_as_klarna_confirms_it() {
+  var completed = "{\"event_id\":\"e-1\",\"session\":{\"session_id\":\"h-1\",\"status\":\"COMPLETED\",\"order_id\":\"k-1\"}}";
+  Http.Get.Stub((url, headers) => KlarnaOrder("RC-1", 29000, "CANCELLED", "ACCEPTED"));
+  Assert.Equal(PaymentEventKind.Other, Provider().HandleEvent(completed, new Dictionary<string, string>())[0].Kind);
+  Http.Get.Stub((url, headers) => KlarnaOrder("RC-1", 29000, "AUTHORIZED", "ACCEPTED"));
+  var e = Provider().HandleEvent(completed, new Dictionary<string, string>())[0];
+  Assert.Equal(PaymentEventKind.Paid, e.Kind);
+  Assert.Equal("RC-1", e.Reference);
+  Assert.Equal(29000, e.Amount);
+}
+
+[Test]
+void refunding_an_order_never_captured_cancels_it_and_a_captured_one_is_refunded() {
+  var urls = new List<string>();
+  Http.Post.Stub((url, body) => { urls.Add(url); return new HttpResponse { StatusCode = 201, Body = "{}" }; });
+  Http.Get.Stub((url, headers) => KlarnaOrder("RC-1", 29000, "AUTHORIZED", "ACCEPTED"));
+  Provider().Refund("k-1", 0, "Changed mind", "o-1");
+  Assert.EndsWith("/ordermanagement/v1/orders/k-1/cancel", urls[0]);
+  Http.Get.Stub((url, headers) => KlarnaOrder("RC-1", 29000, "CAPTURED", "ACCEPTED"));
+  Provider().Refund("k-1", 12000, "Returned", "r-1");
+  Assert.EndsWith("/ordermanagement/v1/orders/k-1/refunds", urls[1]);
+}
+
+[Test]
+void a_settlement_names_the_orders_it_pays_for_and_the_fees_klarna_kept() {
+  var asked = new List<string>();
+  Http.Get.Stub((url, headers) => {
+    asked.Add(url);
+    return url.Contains("/settlements/v1/payouts")
+      ? new HttpResponse { StatusCode = 200, Body = "{\"payouts\":[{\"payment_reference\":\"XISA93DJ\",\"payout_date\":\"2026-09-20T00:00:00Z\","
+          + "\"currency_code\":\"SEK\",\"totals\":{\"settlement_amount\":26545,\"sale_amount\":29000,\"return_amount\":-2000,\"fee_amount\":455,"
+          + "\"commission_amount\":0,\"fee_correction_amount\":0}}],\"pagination\":{\"count\":1,\"total\":1}}" }
+      : new HttpResponse { StatusCode = 200, Body = "{\"transactions\":["
+          + "{\"amount\":29000,\"type\":\"SALE\",\"order_id\":\"k-1\",\"capture_id\":\"c-1\"},"
+          + "{\"amount\":-2000,\"type\":\"RETURN\",\"order_id\":\"k-2\",\"refund_id\":\"r-1\"},"
+          + "{\"amount\":-455,\"type\":\"FEE\",\"order_id\":\"k-1\"}],\"pagination\":{\"count\":3,\"total\":3}}" };
+  });
+  var payout = Provider().Payouts(new DateTime(2026, 9, 1), new DateTime(2026, 9, 30)).Single();
+  Assert.Contains("/settlements/v1/transactions?payment_reference=XISA93DJ", asked[1]);
+  Assert.Equal(26545, payout.Net);
+  Assert.Equal(455, payout.Fees);
+  Assert.Equal(new DateTime(2026, 9, 20), payout.PaidAt.Date);
+  Assert.Equal(["sale", "refund", "fee"], payout.Lines.Select(l => l.Kind).ToList());
+  Assert.Equal("k-2", payout.Lines[1].ProviderRef);
+}
+
+// ── a kept way to pay: a Klarna customer token, made at checkout and charged later without the customer ─────────
+
+PaymentRequest Renewal(string reference, long amount) {
+  return new PaymentRequest { Reference = reference, Currency = "SEK", Amount = amount, Description = "Shop — order " + reference,
+                              Lines = [new PaymentLine { Name = "Coffee subscription", UnitPrice = amount, TaxRate = 1200 }],
+                              IdempotencyKey = "o-1" };
+}
+
+HttpResponse KeptSession(string reference, long amount, string status) {
+  return new HttpResponse { StatusCode = 200, Body = "{\"session_id\":\"s-9\",\"status\":\"" + status + "\",\"intent\":\"buy_and_tokenize\","
+    + "\"purchase_country\":\"SE\",\"purchase_currency\":\"SEK\",\"locale\":\"sv-SE\",\"order_amount\":" + Convert.ToString(amount)
+    + ",\"order_tax_amount\":0,\"merchant_reference1\":\"" + reference + "\","
+    + "\"order_lines\":[{\"name\":\"Coffee subscription\",\"quantity\":1,\"unit_price\":" + Convert.ToString(amount)
+    + ",\"total_amount\":" + Convert.ToString(amount) + ",\"tax_rate\":0,\"total_tax_amount\":0}]}" };
+}
+
+HttpResponse CompletedPage() {
+  return new HttpResponse { StatusCode = 200, Body = "{\"session_id\":\"h-9\",\"status\":\"COMPLETED\",\"authorization_token\":\"auth-9\"}" };
+}
+
+[Test]
+void keeping_the_way_to_pay_opens_a_buy_and_tokenize_session_that_only_authorizes_on_the_hosted_page() {
+  var urls = new List<string>();
+  var posted = new List<string>();
+  Http.Post.Stub((url, body) => {
+    urls.Add(url); posted.Add(body);
+    return new HttpResponse { StatusCode = 200, Body = "{\"session_id\":\"s-9\",\"redirect_url\":\"https://pay.playground.klarna.com/h-9\"}" };
+  });
+  var start = Provider().Start(new PaymentRequest {
+    Reference = "RC-9", Currency = "SEK", Amount = 29000, Description = "Shop — order RC-9",
+    Lines = [new PaymentLine { Name = "Coffee subscription", UnitPrice = 29000 }], SaveMethod = true,
+    ReturnUrl = "https://shop.test/paid/RC-9/klarna-{token}", CancelUrl = "https://shop.test/bag",
+  });
+  Assert.Equal("https://pay.playground.klarna.com/h-9", start.RedirectUrl);
+  Assert.Equal("https://api.playground.klarna.com/payments/v1/sessions", urls[0]);
+  Assert.Contains("\"intent\":\"buy_and_tokenize\"", posted[0]);
+  Assert.Equal("https://api.playground.klarna.com/hpp/v1/sessions", urls[1]);
+  Assert.Contains("\"place_order_mode\":\"NONE\"", posted[1]);        // the order is placed after the token, by Check
+  Assert.Contains("klarna-keep~s-9~{{session_id}}", posted[1]);
+
+  Http.Post.Stub((url, body) => {
+    posted.Add(body);
+    return new HttpResponse { StatusCode = 200, Body = "{\"session_id\":\"s-1\",\"redirect_url\":\"https://pay.playground.klarna.com/h-1\"}" };
+  });
+  Provider().Start(new PaymentRequest {
+    Reference = "RC-1", Currency = "SEK", Amount = 29000, Description = "Shop — order RC-1",
+    Lines = [new PaymentLine { Name = "Lamp", UnitPrice = 29000 }],
+    ReturnUrl = "https://shop.test/paid/RC-1/klarna-{token}", CancelUrl = "https://shop.test/bag",
+  });
+  Assert.Contains("\"intent\":\"buy\"", posted[2]);                    // nothing kept unless asked
+  Assert.Contains("\"place_order_mode\":\"PLACE_ORDER\"", posted[3]);
+}
+
+[Test]
+void the_return_makes_the_customer_token_before_placing_the_order_and_answers_it_with_a_name() {
+  var urls = new List<string>();
+  var posted = new List<string>();
+  Http.Get.Stub((url, headers) =>
+      url.EndsWith("/hpp/v1/sessions/h-9") ? CompletedPage()
+    : url.EndsWith("/payments/v1/sessions/s-9") ? KeptSession("RC-9", 29000, "incomplete")
+    : url.EndsWith("/customer-token/v1/tokens/ct-9") ? new HttpResponse { StatusCode = 200, Body =
+        "{\"payment_method_type\":\"CARD\",\"status\":\"ACTIVE\",\"card\":{\"brand\":\"VISA\",\"expiry_date\":\"12/2030\",\"masked_number\":\"************1234\"}}" }
+    : KlarnaOrder("RC-9", 29000, "AUTHORIZED", "ACCEPTED"));
+  Http.Post.Stub((url, body) => {
+    urls.Add(url); posted.Add(body);
+    return url.EndsWith("/customer-token")
+      ? new HttpResponse { StatusCode = 200, Body = "{\"token_id\":\"ct-9\"}" }
+      : new HttpResponse { StatusCode = 200, Body = "{\"order_id\":\"k-1\",\"fraud_status\":\"ACCEPTED\"}" };
+  });
+  var check = Provider().Check("RC-9", 29000, "keep~s-9~h-9");
+  Assert.Equal(PaymentState.Authorized, check.State);
+  Assert.Equal("k-1", check.ProviderRef);
+  Assert.Equal("ct-9", check.SavedMethod);
+  Assert.Equal("Klarna · Visa •••• 1234", check.SavedMethodLabel);
+  Assert.Equal("https://api.playground.klarna.com/payments/v1/authorizations/auth-9/customer-token", urls[0]);   // token first…
+  Assert.Contains("\"intended_use\":\"SUBSCRIPTION\"", posted[0]);
+  Assert.Equal("https://api.playground.klarna.com/payments/v1/authorizations/auth-9/order", urls[1]);            // …then the order
+  Assert.Contains("\"merchant_reference1\":\"RC-9\"", posted[1]);
+  Assert.Contains("\"order_amount\":29000", posted[1]);
+}
+
+[Test]
+void a_kept_session_for_another_order_or_one_already_placed_places_nothing() {
+  var urls = new List<string>();
+  Http.Post.Stub((url, body) => { urls.Add(url); return new HttpResponse { StatusCode = 200, Body = "{}" }; });
+  Http.Get.Stub((url, headers) => url.Contains("/hpp/") ? CompletedPage() : KeptSession("RC-9", 29000, "incomplete"));
+  Assert.Equal(PaymentState.NotPaid, Provider().Check("RC-2", 29000, "keep~s-9~h-9").State);   // somebody else's session
+  Assert.Equal(PaymentState.NotPaid, Provider().Check("RC-9", 100, "keep~s-9~h-9").State);     // a cheaper basket
+  Http.Get.Stub((url, headers) => url.Contains("/hpp/") ? CompletedPage() : KeptSession("RC-9", 29000, "complete"));
+  Assert.Contains("already been placed", Provider().Check("RC-9", 29000, "keep~s-9~h-9").Message);   // a reload
+  Http.Get.Stub((url, headers) => new HttpResponse { StatusCode = 200, Body = "{\"session_id\":\"h-9\",\"status\":\"IN_PROGRESS\"}" });
+  Assert.Equal(PaymentState.NotPaid, Provider().Check("RC-9", 29000, "keep~s-9~h-9").State);   // not authorized yet
+  Assert.Equal(0, urls.Count);
+}
+
+[Test]
+void a_kept_token_is_charged_for_this_reference_and_amount_once_and_a_refusal_is_an_answer_not_an_error() {
+  var urls = new List<string>();
+  var posted = new List<string>();
+  var keys = new List<string>();
+  Http.Post.Stub((url, body, headers) => {
+    urls.Add(url); posted.Add(body);
+    keys.Add(headers.ContainsKey("Klarna-Idempotency-Key") ? headers["Klarna-Idempotency-Key"] : "");
+    return new HttpResponse { StatusCode = 200, Body = "{\"order_id\":\"k-r1\",\"fraud_status\":\"ACCEPTED\",\"redirect_url\":\"https://x\"}" };
+  });
+  var paid = Provider().ChargeSaved("ct-9", Renewal("RC-10", 10000));
+  Assert.Equal(PaymentState.Paid, paid.State);
+  Assert.Equal("k-r1", paid.ProviderRef);
+  Assert.Equal("https://api.playground.klarna.com/customer-token/v1/tokens/ct-9/order", urls[0]);
+  Assert.Contains("\"merchant_reference1\":\"RC-10\"", posted[0]);
+  Assert.Contains("\"order_amount\":10000", posted[0]);
+  Assert.Contains("\"purchase_currency\":\"SEK\"", posted[0]);
+  Assert.Contains("\"auto_capture\":true", posted[0]);                    // nothing ships, so it is taken at once
+  Assert.Equal("saved-o-1", keys[0]);
+
+  Http.Post.Stub((url, body, headers) => new HttpResponse { StatusCode = 200, Body = "{\"order_id\":\"k-r2\",\"fraud_status\":\"PENDING\"}" });
+  var pending = Provider().ChargeSaved("ct-9", Renewal("RC-11", 10000));
+  Assert.Equal(PaymentState.Pending, pending.State);
+  Assert.Equal("k-r2", pending.ProviderRef);
+
+  Http.Post.Stub((url, body, headers) => new HttpResponse { StatusCode = 403, Body =
+    "{\"error_code\":\"PURCHASE_DECLINED\",\"error_messages\":[\"Purchase declined\"],\"fraud_status\":\"REJECTED\",\"correlation_id\":\"c-1\"}" });
+  var declined = Provider().ChargeSaved("ct-9", Renewal("RC-12", 10000));
+  Assert.Equal(PaymentState.Failed, declined.State);
+  Assert.Equal("Klarna declined the payment.", declined.Message);
+
+  Http.Post.Stub((url, body, headers) => new HttpResponse { StatusCode = 404, Body = "" });
+  var gone = Provider().ChargeSaved("ct-gone", Renewal("RC-13", 10000));
+  Assert.Equal(PaymentState.Failed, gone.State);
+  Assert.Contains("no longer exists", gone.Message);
+
+  Http.Post.Stub((url, body, headers) => new HttpResponse { StatusCode = 400, Body =
+    "{\"error_code\":\"BAD_VALUE\",\"error_messages\":[\"Bad value: order_lines\"]}" });
+  var refused = Provider().ChargeSaved("ct-9", Renewal("RC-14", 10000));
+  Assert.Equal(PaymentState.Failed, refused.State);
+  Assert.Contains("Bad value: order_lines", refused.Message);
+}
+
+[Test]
+void forgetting_a_kept_token_cancels_it_at_klarna() {
+  var urls = new List<string>();
+  var posted = new List<string>();
+  Http.Patch.Stub((url, body) => { urls.Add(url); posted.Add(body); return new HttpResponse { StatusCode = 202, Body = "" }; });
+  Provider().ForgetMethod("ct-9");
+  Assert.Equal("https://api.playground.klarna.com/customer-token/v1/tokens/ct-9/status", urls.Single());
+  Assert.Equal("{\"status\":\"CANCELLED\"}", posted[0]);
+}
+
+// Klarna takes each country's own currency and no other — purchase_country and purchase_currency pair (Klarna,
+// "Purchase countries, currencies and locales"). A pair it would refuse is refused here, before Klarna is asked.
+[Test]
+void klarna_takes_only_the_currency_of_the_buyers_country_and_says_so() {
+  Assert.Equal("", Provider().CurrencyRefusal("SEK", "", "SEK"));             // the app's own market: Sweden
+  Assert.Equal("", Provider().CurrencyRefusal("EUR", "DE", "SEK"));           // a German buyer, in euros
+  Assert.Equal("Klarna takes SEK from a buyer in SE, not EUR.", Provider().CurrencyRefusal("EUR", "", "SEK"));
+  Assert.Equal("Klarna takes NOK from a buyer in NO, not EUR.", Provider().CurrencyRefusal("EUR", "NO", "SEK"));
+  Assert.Equal("Klarna does not take JPY in any country.", Provider().CurrencyRefusal("JPY", "", "SEK"));
+  Assert.Equal("Klarna does not sell to buyers in IS.", Provider().CurrencyRefusal("EUR", "IS", "SEK"));
+  var posted = new List<string>();
+  Http.Post.Stub((url, body) => { posted.Add(body); return new HttpResponse { StatusCode = 200, Body = "{}" }; });
+  var refused = Assert.Throws<ExternalServiceException>(() => Provider().Start(new PaymentRequest {
+    Reference = "RC-7", Currency = "EUR", Amount = 1095, Country = "SE", Description = "Shop — order RC-7",
+    ReturnUrl = "https://shop.test/paid/RC-7/klarna-{token}", CancelUrl = "https://shop.test/bag",
+  }));
+  Assert.Contains("not EUR", refused.Message);
+  Assert.Empty(posted);                                                          // nothing reached Klarna
+}

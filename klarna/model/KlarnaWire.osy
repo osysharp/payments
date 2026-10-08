@@ -1,0 +1,295 @@
+// The Klarna API on the wire. JSON both ways, snake_case, so each field says its own external name.
+namespace Osysharp.Payments.Klarna;
+
+/// One line of what is being bought. Klarna shows these to the shopper, so they are a receipt as well as a total.
+///
+/// ⛔ THE ARITHMETIC IS CHECKED BY KLARNA AND IS THE CLASSIC INTEGRATION FAILURE. `total_amount` must equal
+/// `unit_price × quantity` (less any discount), and the session's own amount must equal the sum of the lines. Klarna
+/// refuses a mismatch with a message about a field rather than about the sum, so `KlarnaClient` COMPUTES both rather
+/// than trusting a caller to — see `OrderLine`.
+public class KlarnaOrderLine {
+  /// `discount` for a line that takes money off (negative); left out for goods.
+  [ExternalName("type")] public string? Type;
+  [ExternalName("name")] public string Name = "";
+  [ExternalName("quantity")] public long Quantity = 1;
+  /// Minor units — 2000 is 20.00. Klarna is as strict about this as Stripe and for the same reason.
+  [ExternalName("unit_price")] public long UnitPrice = 0;
+  [ExternalName("total_amount")] public long TotalAmount = 0;
+  /// Your own SKU or line id. Optional to Klarna and worth sending: it is what makes a capture or a refund months
+  /// later traceable to something in your own system.
+  [ExternalName("reference")] public string? Reference;
+  /// Tax in HUNDREDTHS OF A PERCENT — 2500 is 25%. Not a fraction, and not a percentage.
+  [ExternalName("tax_rate")] public long TaxRate = 0;
+  [ExternalName("total_tax_amount")] public long TotalTaxAmount = 0;
+}
+
+/// What `POST /payments/v1/sessions` answers.
+public class KlarnaSession {
+  [ExternalName("session_id")] public string? SessionId;
+  /// ⭐ WHAT THE BROWSER NEEDS, and the only field here meant to leave the server. It launches Klarna's widget and is
+  /// scoped to this session; it is not a credential for anything else.
+  [ExternalName("client_token")] public string? ClientToken;
+  /// The Klarna methods available for this shopper and basket — `pay_now`, `pay_later`, `pay_over_time`. Which ones
+  /// appear depends on the country, the amount and Klarna's own assessment, so a method missing here is an answer
+  /// rather than a fault.
+  [ExternalName("payment_method_categories")] public List<KlarnaPaymentMethod> PaymentMethodCategories = [];
+
+  // What reading a session back (`GET /payments/v1/sessions/{id}`) adds — the basket as Klarna holds it.
+  /// `complete` once an order has been placed against the session, `incomplete` before.
+  [ExternalName("status")] public string? Status;
+  /// `buy` · `tokenize` · `buy_and_tokenize`.
+  [ExternalName("intent")] public string? Intent;
+  [ExternalName("purchase_country")] public string? PurchaseCountry;
+  [ExternalName("purchase_currency")] public string? PurchaseCurrency;
+  [ExternalName("locale")] public string? Locale;
+  [ExternalName("order_amount")] public long OrderAmount = 0;
+  [ExternalName("order_tax_amount")] public long OrderTaxAmount = 0;
+  [ExternalName("order_lines")] public List<KlarnaOrderLine> OrderLines = [];
+  [ExternalName("merchant_reference1")] public string? MerchantReference;
+}
+
+/// One payment method Klarna is offering for this session.
+public class KlarnaPaymentMethod {
+  [ExternalName("identifier")] public string? Identifier;
+  [ExternalName("name")] public string? Name;
+}
+
+/// What `POST /payments/v1/authorizations/{token}/order` answers — the order exists from here on.
+public class KlarnaOrder {
+  /// ⭐ STORE THIS. It is the handle for capture, refund and cancel, and it is the only thing that ties a Klarna
+  /// order to yours after the shopper has closed the tab.
+  [ExternalName("order_id")] public string? OrderId;
+  /// Where to send the shopper next. Klarna may need a further step (a bank app, an identification), so a flow that
+  /// ignores this works until the first shopper who needs it.
+  [ExternalName("redirect_url")] public string? RedirectUrl;
+  /// `ACCEPTED` · `PENDING` · `REJECTED`. ⛔ `PENDING` is not a failure and not a success: Klarna is still deciding,
+  /// and the answer arrives on a notification. Treating it as either is the commonest wrong branch here.
+  [ExternalName("fraud_status")] public string? FraudStatus;
+}
+
+/// What a capture answers.
+public class KlarnaCapture {
+  [ExternalName("capture_id")] public string? CaptureId;
+}
+
+/// What Klarna says when it refuses. `error_messages` is a LIST — a basket with three bad lines is refused once,
+/// naming all three, and showing only the first would send the reader round the loop twice.
+public class KlarnaError {
+  [ExternalName("error_code")] public string? ErrorCode;
+  [ExternalName("error_messages")] public List<string> ErrorMessages = [];
+  [ExternalName("correlation_id")] public string? CorrelationId;
+  /// On a refused order: Klarna's verdict (`REJECTED`) and why, when it says.
+  [ExternalName("fraud_status")] public string? FraudStatus;
+  [ExternalName("reason")] public string? Reason;
+}
+
+// ── what goes UP ────────────────────────────────────────────────────────────────────────────────────────────────
+//
+// ⚠ CLASSES, NOT `new { … }`. An anonymous object in Osy# IS a `Json` document, so handing one to
+// `JsonSerializer.Serialize` encodes it twice and sends a JSON *string* of escaped JSON. A declared class is the
+// shape `Serialize` is for — and it is also what makes `DefaultIgnoreCondition = WhenWritingNull` reachable, which is
+// the difference between an omitted field and an explicit `null`. Same reasoning as `Osysharp.Resend`'s wire types.
+
+/// What `POST /payments/v1/sessions` and the order call both take.
+public class KlarnaPurchaseRequest {
+  [ExternalName("purchase_country")] public string PurchaseCountry = "";
+  [ExternalName("purchase_currency")] public string PurchaseCurrency = "";
+  [ExternalName("locale")] public string Locale = "";
+  /// ⛔ COMPUTED FROM THE LINES, never taken from the caller — Klarna refuses a mismatch naming a field rather than
+  /// the sum.
+  [ExternalName("order_amount")] public long OrderAmount = 0;
+  [ExternalName("order_tax_amount")] public long OrderTaxAmount = 0;
+  [ExternalName("order_lines")] public List<KlarnaOrderLine> OrderLines = [];
+  /// `buy` for a one-off purchase. Absent on the order call, which is why it is nullable.
+  [ExternalName("intent")] public string? Intent;
+  /// YOUR order's reference, carried on Klarna's order — what ties the two together when the shopper comes back, and
+  /// what a return page must check before it believes an order id it was handed.
+  [ExternalName("merchant_reference1")] public string? MerchantReference;
+}
+
+/// `POST /hpp/v1/sessions` — Klarna's Hosted Payment Page over a payment session.
+public class KlarnaHostedPageRequest {
+  [ExternalName("payment_session_url")] public string PaymentSessionUrl = "";
+  [ExternalName("merchant_urls")] public KlarnaMerchantUrls MerchantUrls = new KlarnaMerchantUrls();
+  [ExternalName("options")] public KlarnaHostedPageOptions? Options;
+}
+
+/// Where Klarna sends the shopper back. Klarna fills `{{session_id}}`, `{{authorization_token}}` and `{{order_id}}`
+/// in these before it redirects.
+public class KlarnaMerchantUrls {
+  [ExternalName("success")] public string Success = "";
+  [ExternalName("cancel")] public string Cancel = "";
+  [ExternalName("back")] public string Back = "";
+  [ExternalName("failure")] public string Failure = "";
+  [ExternalName("error")] public string Error = "";
+  /// Where Klarna POSTs when the session completes — the shopper's browser may never come back, so a shop that only
+  /// listens at `success` loses the orders whose customer closed the tab. Absent unless given.
+  [ExternalName("status_update")] public string? StatusUpdate;
+}
+
+public class KlarnaHostedPageOptions {
+  /// `PLACE_ORDER` has Klarna create the order when the shopper finishes, and `{{order_id}}` is filled in the success
+  /// address; `NONE` leaves an authorization token for you to turn into an order yourself.
+  [ExternalName("place_order_mode")] public string? PlaceOrderMode;
+}
+
+/// What the Hosted Payment Page answers: where to send the shopper.
+public class KlarnaHostedPage {
+  [ExternalName("session_id")] public string? SessionId;
+  [ExternalName("redirect_url")] public string? RedirectUrl;
+}
+
+/// What Klarna POSTs to `status_update`. ⛔ UNSIGNED: anybody can post this shape. Treat the order id as a claim and
+/// read the order back with `GetOrder` before acting on it.
+public class KlarnaHostedPageEvent {
+  [ExternalName("event_id")] public string? EventId;
+  [ExternalName("session")] public KlarnaHostedPageSession? Session;
+}
+
+public class KlarnaHostedPageSession {
+  [ExternalName("session_id")] public string? SessionId;
+  /// `WAITING` · `IN_PROGRESS` · `COMPLETED` · `CANCELLED` · `FAILED` · `DISABLED` · `ERROR`.
+  [ExternalName("status")] public string? Status;
+  /// Filled when the page placed the order (`PLACE_ORDER`).
+  [ExternalName("order_id")] public string? OrderId;
+  /// The shopper's authorization, for a page over a payment session — what the order and a customer token are made
+  /// from when the page does not place the order itself.
+  [ExternalName("authorization_token")] public string? AuthorizationToken;
+}
+
+// ── a kept way to pay ─────────────────────────────────────────────────────────────────────────────────────────────
+
+/// `POST /payments/v1/authorizations/{token}/customer-token`.
+public class KlarnaCustomerTokenRequest {
+  [ExternalName("purchase_country")] public string PurchaseCountry = "";
+  [ExternalName("purchase_currency")] public string PurchaseCurrency = "";
+  [ExternalName("locale")] public string Locale = "";
+  /// What the token is for, in words — 1 to 255 characters.
+  [ExternalName("description")] public string Description = "";
+  /// `SUBSCRIPTION`, the one value Klarna lists.
+  [ExternalName("intended_use")] public string IntendedUse = "SUBSCRIPTION";
+}
+
+/// What creating a customer token answers.
+public class KlarnaCustomerToken {
+  /// ⭐ THE TOKEN — what a later order is placed with. Keep it where only the shop reads it.
+  [ExternalName("token_id")] public string? TokenId;
+  [ExternalName("payment_method_reference")] public string? PaymentMethodReference;
+  [ExternalName("redirect_url")] public string? RedirectUrl;
+}
+
+/// A customer token read back (`GET /customer-token/v1/tokens/{token}`).
+public class KlarnaCustomerTokenDetails {
+  /// `INVOICE`, `CARD`, `DIRECT_DEBIT`, …
+  [ExternalName("payment_method_type")] public string? PaymentMethodType;
+  /// `ACTIVE` · `CANCELLED` · `SUSPENDED`.
+  [ExternalName("status")] public string? Status;
+  [ExternalName("card")] public KlarnaTokenCard? Card;
+  [ExternalName("direct_debit")] public KlarnaTokenDirectDebit? DirectDebit;
+}
+
+public class KlarnaTokenCard {
+  /// `VISA`, `MASTERCARD`, …
+  [ExternalName("brand")] public string? Brand;
+  [ExternalName("expiry_date")] public string? ExpiryDate;
+  /// `************1234`.
+  [ExternalName("masked_number")] public string? MaskedNumber;
+}
+
+public class KlarnaTokenDirectDebit {
+  [ExternalName("masked_number")] public string? MaskedNumber;
+}
+
+/// `POST /customer-token/v1/tokens/{token}/order` — Klarna's `customer_token_order`. No country and no locale: the
+/// token already carries them.
+public class KlarnaTokenOrderRequest {
+  [ExternalName("purchase_currency")] public string PurchaseCurrency = "";
+  [ExternalName("order_amount")] public long OrderAmount = 0;
+  [ExternalName("order_tax_amount")] public long OrderTaxAmount = 0;
+  [ExternalName("order_lines")] public List<KlarnaOrderLine> OrderLines = [];
+  [ExternalName("merchant_reference1")] public string? MerchantReference;
+  /// Take the money as the order is placed. A renewal ships nothing, so there is no later moment to capture on.
+  [ExternalName("auto_capture")] public bool AutoCapture = false;
+}
+
+/// What a token order came to: the order when Klarna placed it, or its status and error when it refused.
+public class KlarnaTokenCharge {
+  public int StatusCode = 0;
+  public KlarnaOrder? Order;
+  public KlarnaError? Error;
+  /// The whole failure in one line, as every other call of the client words it — for a log, not for the customer.
+  public string Failure = "";
+}
+
+/// `PATCH /customer-token/v1/tokens/{token}/status`.
+public class KlarnaTokenStatusRequest {
+  /// `CANCELLED`, the one value Klarna lists.
+  [ExternalName("status")] public string Status = "CANCELLED";
+}
+
+/// An order as Klarna's order management reads it back.
+public class KlarnaOrderDetails {
+  [ExternalName("order_id")] public string? OrderId;
+  /// `AUTHORIZED` · `PART_CAPTURED` · `CAPTURED` · `CANCELLED` · `EXPIRED` · `CLOSED`.
+  [ExternalName("status")] public string? Status;
+  [ExternalName("fraud_status")] public string? FraudStatus;
+  [ExternalName("order_amount")] public long OrderAmount = 0;
+  [ExternalName("merchant_reference1")] public string? MerchantReference;
+}
+
+/// A capture. Both fields absent means "all of it, no description".
+public class KlarnaCaptureRequest {
+  /// ⚠ ABSENT means the whole order. Sending `0` captures NOTHING and answers success — the shopper unbilled and
+  /// nothing anywhere saying so — which is why this is nullable rather than defaulted.
+  [ExternalName("captured_amount")] public long? CapturedAmount;
+  [ExternalName("description")] public string? Description;
+}
+
+/// A refund. Same rule: absent means everything captured.
+public class KlarnaRefundRequest {
+  [ExternalName("refunded_amount")] public long? RefundedAmount;
+  [ExternalName("description")] public string? Description;
+}
+
+// ── settlements ───────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// A payout's totals, in minor units (Settlements API v1).
+public class KlarnaPayoutTotals {
+  [ExternalName("settlement_amount")] public long SettlementAmount;
+  [ExternalName("sale_amount")] public long SaleAmount;
+  [ExternalName("return_amount")] public long ReturnAmount;
+  [ExternalName("fee_amount")] public long FeeAmount;
+  [ExternalName("fee_correction_amount")] public long FeeCorrectionAmount;
+  [ExternalName("commission_amount")] public long CommissionAmount;
+  [ExternalName("holdback_amount")] public long HoldbackAmount;
+  [ExternalName("release_amount")] public long ReleaseAmount;
+  [ExternalName("repay_amount")] public long RepayAmount;
+  [ExternalName("reversal_amount")] public long ReversalAmount;
+  [ExternalName("tax_amount")] public long TaxAmount;
+}
+
+public class KlarnaPayout {
+  [ExternalName("payment_reference")] public string? PaymentReference;
+  [ExternalName("payout_date")] public string? PayoutDate;
+  [ExternalName("currency_code")] public string? CurrencyCode;
+  [ExternalName("totals")] public KlarnaPayoutTotals? Totals;
+}
+
+public class KlarnaPayoutList {
+  [ExternalName("payouts")] public List<KlarnaPayout> Payouts = [];
+}
+
+/// One transaction in a payout — `OrderId` is Klarna's order id, the app's `ProviderRef`.
+public class KlarnaSettlementTransaction {
+  [ExternalName("amount")] public long Amount;
+  /// SALE · RETURN · FEE · REVERSAL · CORRECTION …
+  [ExternalName("type")] public string? Type;
+  [ExternalName("order_id")] public string? OrderId;
+  [ExternalName("capture_id")] public string? CaptureId;
+  [ExternalName("refund_id")] public string? RefundId;
+  [ExternalName("merchant_reference1")] public string? MerchantReference1;
+}
+
+public class KlarnaSettlementTransactionList {
+  [ExternalName("transactions")] public List<KlarnaSettlementTransaction> Transactions = [];
+}

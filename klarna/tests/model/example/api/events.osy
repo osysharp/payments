@@ -1,0 +1,18 @@
+// 3. The callback: Klarna POSTs here when a session completes, whether or not the shopper came back.
+//    It is unsigned, so it only says WHICH order to ask about; Paid() in klarna.osy does the asking.
+namespace ShopExample;
+using Osysharp.Payments.Klarna;
+
+[AllowAnonymous] string KlarnaEvents() {
+  var e = JsonSerializer.Deserialize<KlarnaHostedPageEvent>(Request.RawBody ?? "");
+  if (e.Session?.Status == "COMPLETED" && e.Session?.OrderId != null) {
+    Log.Information("Klarna placed {Order}", e.Session.OrderId);
+  }
+  return "ok";
+}
+
+// The route the callback lives at: /api/klarna/events, open (Klarna has no account here), raw body.
+app.Apis = [ new RestApi("Klarna") {
+  Route = "klarna", Auth = new ApiAuth { Anonymous = true },
+  Endpoints = [ new Endpoint(KlarnaEvents) { Method = HttpMethod.Post, Path = "/events", Raw = true } ],
+} ];

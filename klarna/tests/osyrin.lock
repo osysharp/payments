@@ -1,0 +1,54 @@
+{
+  "platform": {
+    "version": "0.9.0"
+  },
+  "entries": [
+    {
+      "name": "Osysharp.Http",
+      "kind": "package",
+      "version": "1.0.0",
+      "hash": "sha256:4c24068aeea5ef1a155459d4cc332c85d7ee3d96049f2404e54ac860d94beb0f",
+      "minPlatform": "0.9.0",
+      "shadow": "app-forkable",
+      "source": "workspace:Platform.Core/Dsl/OsySharp/Baseline/Capabilities/Http"
+    },
+    {
+      "name": "Osysharp.Payments",
+      "kind": "package",
+      "version": "0.1.0",
+      "hash": "sha256:24c25dc952d65c184b67b1c80f75ee1825e8e4fd6d5417c5e477fa77b5d8fd87",
+      "minPlatform": "0.9.0",
+      "shadow": "app-forkable",
+      "source": "workspace:kits/payments",
+      "constraint": "0"
+    },
+    {
+      "name": "Osysharp.Payments.Klarna",
+      "kind": "package",
+      "version": "0.1.0",
+      "hash": "sha256:2d6e70230af5d2126a0bd2930a7bd889c35372e18329c7da223b6fbadecaee2c",
+      "minPlatform": "0.9.0",
+      "shadow": "app-forkable",
+      "source": "workspace:kits/klarna",
+      "constraint": "0"
+    },
+    {
+      "name": "Osysharp.Ui",
+      "kind": "package",
+      "version": "2.17.1",
+      "hash": "sha256:17d6d844ed71d4d614d43a6993723da70b2d39241c31e9f9fb58250a5183263c",
+      "minPlatform": "0.9.0",
+      "shadow": "app-forkable",
+      "source": "workspace:Platform.Core/Dsl/OsySharp/Baseline/Capabilities/Ui"
+    }
+  ],
+  "bridges": {
+    "searched": [
+      "workspace",
+      "platform"
+    ],
+    "skipped": [
+      "github: offline \u2014 the public catalog was not searched for bridges. Run \u0060osy lock\u0060 with a network to look."
+    ]
+  }
+}

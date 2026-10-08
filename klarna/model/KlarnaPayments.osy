@@ -1,0 +1,272 @@
+namespace Osysharp.Payments.Klarna;
+
+using Osysharp.Payments;
+
+/// Klarna as a way to pay — pay now, later or in parts on Klarna's Hosted Payment Page — through the
+/// `Osysharp.Payments` contract. List it among your app's providers:
+///
+///     new KlarnaPayments { Username = Secret.KlarnaUsername, Password = Secret.KlarnaPassword,
+///                          Country = "SE", Locale = "sv-SE", Playground = true }
+///
+/// ⚑ KLARNA AUTHORISES AT CHECKOUT AND CHARGES WHEN YOU SHIP. `CapturesLater` is true, so the app captures when the
+///   goods go out; an order that never ships is cancelled and the customer is never charged.
+///
+/// ⚑ IT CAN KEEP THE WAY TO PAY (`SaveMethod`) as a Klarna customer token, which `ChargeSaved` charges later with the
+///   customer not there — see `Start` for why that payment is placed on the return rather than by Klarna's page.
+public class KlarnaPayments : IPaymentProvider {
+  public string Key { get; set; } = "klarna";
+  public string Label { get; set; } = "Klarna";
+  public string Description { get; set; } = "Pay now, later or in parts on Klarna's page — charged when your order is sent.";
+  public bool CapturesLater { get; } = true;
+  public bool IsManual { get; } = false;
+  /// Klarna signs nothing: its callback is read back from Klarna instead.
+  public List<string> EventHeaders { get; } = [];
+
+  public string Username = "";
+  public string Password = "";
+  /// Klarna's test environment. Playground credentials work only there, live ones only against the live API.
+  public bool Playground = false;
+  /// The market, when the app sells in one: ISO 3166 "SE" and a locale "sv-SE". A request's own wins when it has one.
+  public string Country = "";
+  public string Locale = "";
+
+  public bool IsReady() { return Username != "" && Password != ""; }
+  /// Klarna takes each country's OWN currency and no other — `purchase_country` and `purchase_currency` must pair:
+  /// SE with SEK, DE with EUR, NO with NOK… (Klarna, "Purchase countries, currencies and locales":
+  /// https://docs.klarna.com/klarna-payments/in-depth-knowledge/puchase-countries-currencies-locales/ — "We only
+  /// support the local currency of each country"). So a checkout in euros is offered Klarna only for a buyer in a
+  /// euro country, and one in kronor only for a buyer in Sweden. With no country yet, the app's own market decides.
+  public string CurrencyRefusal(string currency, string country, string sellers) {
+    var code = currency.Trim().ToUpper();
+    var market = country.Trim() != "" ? country.Trim().ToUpper() : Country.Trim().ToUpper();
+    var pairs = KlarnaMarkets();
+    if (!pairs.ContainsValue(code)) { return $"Klarna does not take {code} in any country."; }
+    if (market == "") { return ""; }
+    if (!pairs.ContainsKey(market)) { return $"Klarna does not sell to buyers in {market}."; }
+    return pairs[market] == code ? "" : $"Klarna takes {pairs[market]} from a buyer in {market}, not {code}.";
+  }
+
+  /// Every country Klarna Payments sells in, with the one currency it takes there (the page cited above).
+  public Dictionary<string, string> KlarnaMarkets() {
+    return new Dictionary<string, string> {
+      { "AU", "AUD" }, { "AT", "EUR" }, { "BE", "EUR" }, { "CA", "CAD" }, { "CZ", "CZK" }, { "DK", "DKK" }, { "FI", "EUR" },
+      { "FR", "EUR" }, { "DE", "EUR" }, { "GR", "EUR" }, { "HU", "HUF" }, { "IE", "EUR" }, { "IT", "EUR" }, { "MX", "MXN" },
+      { "NL", "EUR" }, { "NZ", "NZD" }, { "NO", "NOK" }, { "PL", "PLN" }, { "PT", "EUR" }, { "RO", "RON" }, { "SK", "EUR" },
+      { "ES", "EUR" }, { "SE", "SEK" }, { "CH", "CHF" }, { "GB", "GBP" }, { "US", "USD" }
+    };
+  }
+
+  /// A way to pay kept at checkout (`PaymentRequest.SaveMethod`) — a Klarna customer token — is charged later without
+  /// the customer.
+  public bool SavesMethods { get; } = true;
+
+  /// A renewal: an order on the kept customer token, captured as it is placed (nothing ships to capture on), keyed so
+  /// a retried renewal is one order. Klarna's refusal — a 4xx, or an order it did not accept — answers Failed with a
+  /// sentence for the customer, never an exception.
+  public PaymentCheck ChargeSaved(string savedMethod, PaymentRequest request) {
+    if (savedMethod == "") { return new PaymentCheck { State = PaymentState.Failed, Message = "There is no saved Klarna payment method to charge." }; }
+    KlarnaTokenCharge charge;
+    try {
+      charge = Client(request).ChargeToken(savedMethod, Basket(request), request.Reference,
+                                           request.IdempotencyKey == "" ? null : "saved-" + request.IdempotencyKey);
+    }
+    catch (ExternalServiceException ex) {
+      return new PaymentCheck { State = PaymentState.Failed, Message = ex.Message };
+    }
+    var order = charge.Order;
+    if (order == null) {
+      Log.Warning($"Klarna refused a saved-method charge for {request.Reference}: {charge.Failure}");
+      return new PaymentCheck { State = PaymentState.Failed, Message = RefusalOf(charge) };
+    }
+    var orderId = order.OrderId ?? "";
+    if (order.FraudStatus == "ACCEPTED") { return new PaymentCheck { State = PaymentState.Paid, ProviderRef = orderId }; }
+    if (order.FraudStatus == "PENDING") {
+      return new PaymentCheck { State = PaymentState.Pending, ProviderRef = orderId,
+                                Message = "Klarna is still checking the payment — it has not been taken yet." };
+    }
+    return new PaymentCheck { State = PaymentState.Failed, ProviderRef = orderId, Message = "Klarna declined the payment." };
+  }
+
+  /// What to tell the customer when Klarna would not place a token order.
+  string RefusalOf(KlarnaTokenCharge charge) {
+    if (charge.StatusCode == 404) { return "The saved Klarna payment method no longer exists — choose another way to pay."; }
+    if (charge.Error?.FraudStatus == "REJECTED" || charge.StatusCode == 403) { return "Klarna declined the payment."; }
+    if (charge.StatusCode == 400 || charge.StatusCode == 409) {
+      var said = charge.Error == null ? "" : string.Join(" ", charge.Error!.ErrorMessages);
+      return said == "" ? "Klarna could not take the payment." : "Klarna could not take the payment: " + said;
+    }
+    return "Klarna could not take the payment right now — nothing was charged.";
+  }
+
+  /// The customer removed a kept way to pay: the customer token is cancelled at Klarna.
+  public void ForgetMethod(string savedMethod) {
+    if (savedMethod != "") { Client(null).CancelCustomerToken(savedMethod); }
+  }
+
+  /// Klarna's settlements to the bank, each with the sales and returns it covers (by Klarna order id — the app's
+  /// `ProviderRef`) and the fees Klarna kept.
+  public List<Payout> Payouts(DateTime from, DateTime to) {
+    var klarna = Client(null);
+    List<Payout> payouts = [];
+    foreach (var p in klarna.Payouts(from, to)) {
+      var totals = p.Totals ?? new KlarnaPayoutTotals();
+      var payout = new Payout { Id = p.PaymentReference ?? "", Currency = p.CurrencyCode ?? "", Net = totals.SettlementAmount,
+                                Fees = totals.FeeAmount + totals.CommissionAmount - totals.FeeCorrectionAmount,
+                                PaidAt = p.PayoutDate == null ? DateTime.UtcNow : DateTime.Parse(p.PayoutDate) };
+      foreach (var t in klarna.PayoutTransactions(payout.Id)) {
+        var kind = t.Type == "SALE" ? "sale" : t.Type == "RETURN" ? "refund" : t.Type == "FEE" ? "fee" : "other";
+        payout.Lines.Add(new PayoutLine { ProviderRef = t.OrderId ?? "", Kind = kind, Amount = t.Amount });
+      }
+      payouts.Add(payout);
+    }
+    return payouts;
+  }
+
+  KlarnaClient Client(PaymentRequest? request) {
+    return new KlarnaClient {
+      Username = Username, Password = Password,
+      BaseUrl = Playground ? "https://api.playground.klarna.com" : "https://api.klarna.com",
+      PurchaseCountry = request?.Country ?? Country, Locale = request?.Locale ?? Locale,
+      PurchaseCurrency = request?.Currency ?? "",
+    };
+  }
+
+  List<BasketLine> Basket(PaymentRequest request) {
+    List<BasketLine> basket = [];
+    foreach (var l in request.Lines) {
+      basket.Add(new BasketLine { Name = l.Name, Quantity = l.Quantity, UnitPrice = l.UnitPrice, TaxRate = l.TaxRate,
+                                  Type = l.UnitPrice < 0 ? "discount" : null,
+                                  Reference = l.Reference });
+    }
+    if (basket.Count == 0) { basket.Add(new BasketLine { Name = request.Description, UnitPrice = request.Amount }); }
+    return basket;
+  }
+
+  /// What a return address carries for a payment that keeps its way to pay: the payment session and the hosted page,
+  /// both Klarna's ids, which `Check` reads back.
+  const string Keeping = "keep~";
+
+  /// ⚑ TWO SHAPES. A plain payment lets Klarna's page place the order and come back with its id. One that keeps the
+  ///   way to pay (`SaveMethod`) opens a `buy_and_tokenize` session and the page only AUTHORIZES — the customer token
+  ///   must be made from that authorization before an order closes the session, so `Check` makes the token and then
+  ///   places the order, in that order.
+  public PaymentStart Start(PaymentRequest request) {
+    // A country and a currency that do not pair are refused here, before Klarna is asked.
+    var refusal = CurrencyRefusal(request.Currency, request.Country ?? "", "");
+    if (refusal != "") { throw new ExternalServiceException(refusal); }
+    var klarna = Client(request);
+    var session = klarna.CreateSession(Basket(request), request.Reference, request.SaveMethod ? "buy_and_tokenize" : "buy");
+    var sessionId = session.SessionId ?? "";
+    var back = request.SaveMethod ? Keeping + sessionId + "~{{session_id}}" : "{{order_id}}";
+    var page = klarna.CreateHostedPage(sessionId, request.ReturnUrl.Replace("{token}", back),
+                                       request.CancelUrl, request.CancelUrl, !request.SaveMethod,
+                                       request.EventsUrl == "" ? null : request.EventsUrl);
+    return new PaymentStart { RedirectUrl = page.RedirectUrl ?? "", ProviderRef = session.SessionId };
+  }
+
+  /// Read the order back from Klarna — a return address or a callback only says which order to ask about.
+  public PaymentCheck Check(string reference, long amount, string token) {
+    if (token == "") { return new PaymentCheck { Message = "The payment was not completed." }; }
+    if (token.StartsWith(Keeping)) { return CheckKeeping(reference, amount, token.Substring(Keeping.Length)); }
+    var theirs = Client(null).GetOrder(token);
+    if (theirs.MerchantReference != reference) { return new PaymentCheck { Message = "That Klarna payment is not for this order." }; }
+    if (theirs.OrderAmount != amount) { return new PaymentCheck { Message = "The Klarna payment does not match this order's total." }; }
+    var status = theirs.Status ?? "";
+    if (status != "AUTHORIZED" && status != "PART_CAPTURED" && status != "CAPTURED") {
+      return new PaymentCheck { Message = "The payment has not gone through." };
+    }
+    if (theirs.FraudStatus == "PENDING") {
+      return new PaymentCheck { State = PaymentState.Pending, ProviderRef = token,
+                                Message = "Klarna is still checking the payment — we will mail you when it clears." };
+    }
+    if (theirs.FraudStatus != "ACCEPTED") { return new PaymentCheck { Message = "Klarna did not accept the payment." }; }
+    return new PaymentCheck { State = status == "AUTHORIZED" ? PaymentState.Authorized : PaymentState.Paid, ProviderRef = token };
+  }
+
+  /// The return from a payment that keeps its way to pay. Every id in the address is read back from Klarna: the page
+  /// must be COMPLETED and hold the authorization, and the session must be THIS reference for THIS amount. Then the
+  /// customer token is made from the authorization and the order placed with the session's own basket — token first,
+  /// because the order closes the session — and the order is checked like any other.
+  PaymentCheck CheckKeeping(string reference, long amount, string ids) {
+    var tilde = ids.IndexOf("~");
+    if (tilde <= 0) { return new PaymentCheck { Message = "The payment was not completed." }; }
+    var klarna = Client(null);
+    var page = klarna.GetHostedPage(ids.Substring(tilde + 1));
+    var authorization = page.AuthorizationToken ?? "";
+    if (page.Status != "COMPLETED" || authorization == "") { return new PaymentCheck { Message = "The payment was not completed." }; }
+    var session = klarna.GetSession(ids.Substring(0, tilde));
+    if (session.MerchantReference != reference) { return new PaymentCheck { Message = "That Klarna payment is not for this order." }; }
+    if (session.OrderAmount != amount) { return new PaymentCheck { Message = "The Klarna payment does not match this order's total." }; }
+    // ⚠ A second visit to the return page finds the order already placed, and the authorization spent: Klarna keeps
+    //   no way to find that order again from here, so this answers what happened rather than placing a second one.
+    if (session.Status == "complete") {
+      return new PaymentCheck { Message = "This Klarna payment has already been placed — its confirmation is on its way." };
+    }
+    var market = new KlarnaClient {
+      Username = Username, Password = Password, BaseUrl = klarna.BaseUrl,
+      PurchaseCountry = session.PurchaseCountry ?? Country, PurchaseCurrency = session.PurchaseCurrency ?? "", Locale = session.Locale ?? Locale,
+    };
+    var kept = "";
+    try { kept = market.CreateCustomerToken(authorization, "Saved at order " + reference).TokenId ?? ""; }
+    catch (ExternalServiceException ex) {
+      // The order still goes through — the customer authorized it — and the answer says plainly nothing was kept.
+      Log.Warning($"Klarna did not keep the way to pay for {reference}: {ex.Message}");
+    }
+    var order = market.PlaceSessionOrder(authorization, session);
+    var check = Check(reference, amount, order.OrderId ?? "");
+    if (kept != "" && check.State != PaymentState.NotPaid && check.State != PaymentState.Failed) {
+      check.SavedMethod = kept;
+      check.SavedMethodLabel = LabelOf(kept);
+    }
+    return check;
+  }
+
+  /// What the customer calls a kept Klarna token — "Klarna · Visa •••• 1234", or the kind of Klarna payment it is.
+  string LabelOf(string customerToken) {
+    try {
+      var token = Client(null).GetCustomerToken(customerToken);
+      var masked = token.Card?.MaskedNumber ?? token.DirectDebit?.MaskedNumber ?? "";
+      var last = masked.Length >= 4 ? masked.Substring(masked.Length - 4) : masked;
+      if (token.Card != null) {
+        var brand = token.Card!.Brand ?? ""; if (brand == "") { brand = "card"; }
+        return "Klarna · " + brand.Substring(0, 1).ToUpper() + brand.Substring(1).ToLower() + " •••• " + last;
+      }
+      if (token.DirectDebit != null) { return "Klarna · direct debit •••• " + last; }
+      var kind = (token.PaymentMethodType ?? "").ToLower().Replace("_", " ");
+      return kind == "" ? "Klarna" : "Klarna · " + kind;
+    }
+    catch (ExternalServiceException ex) {
+      Log.Warning($"Klarna's kept payment method could not be read for its name: {ex.Message}");
+      return "Klarna";
+    }
+  }
+
+  public void Capture(string providerRef, long amount) { Client(null).Capture(providerRef, amount); }
+
+  /// Klarna refunds against a capture only: an order that was never captured is cancelled instead.
+  public PaymentRefund Refund(string providerRef, long amount, string reason, string idempotencyKey) {
+    var klarna = Client(null);
+    var order = klarna.GetOrder(providerRef);
+    if (order.Status == "AUTHORIZED") { klarna.Cancel(providerRef); }
+    else { klarna.Refund(providerRef, amount, reason == "" ? null : reason); }
+    return new PaymentRefund { State = RefundState.Succeeded, RefundRef = "klarna-" + idempotencyKey };
+  }
+
+  public void Cancel(string providerRef) { Client(null).Cancel(providerRef); }
+
+  /// Klarna's hosted-page status callback. ⛔ Unsigned — so the order it names is read back from Klarna, and the
+  /// event carries what KLARNA says, not what the body claimed.
+  public List<PaymentEvent> HandleEvent(string body, Dictionary<string, string> headers) {
+    var e = JsonSerializer.Deserialize<KlarnaHostedPageEvent>(body);
+    var orderId = e.Session?.OrderId ?? "";
+    if (e.Session?.Status != "COMPLETED" || orderId == "") { return [new PaymentEvent { Kind = PaymentEventKind.Other }]; }
+    var theirs = Client(null).GetOrder(orderId);
+    if (theirs.FraudStatus != "ACCEPTED" || (theirs.Status != "AUTHORIZED" && theirs.Status != "CAPTURED")) {
+      return [new PaymentEvent { Kind = PaymentEventKind.Other }];
+    }
+    return [new PaymentEvent {
+      Kind = PaymentEventKind.Paid, Reference = theirs.MerchantReference ?? "", ProviderRef = orderId,
+      State = theirs.Status == "AUTHORIZED" ? PaymentState.Authorized : PaymentState.Paid, Amount = theirs.OrderAmount,
+    }];
+  }
+}

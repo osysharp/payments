@@ -1,0 +1,406 @@
+namespace Osysharp.Payments.Klarna;
+
+using Osysharp.Http;
+
+/// One thing in the basket, as an app writes it — the shape a caller SHOULD have to fill in.
+///
+/// ⭐ THERE IS NO `TotalAmount` HERE ON PURPOSE. Klarna requires `total_amount = unit_price × quantity` and refuses a
+/// mismatch, so a field the caller can get wrong is a field the kit should not have. `KlarnaClient` computes it.
+public class BasketLine {
+  public string Name = "";
+  public long Quantity = 1;
+  /// Minor units — 2000 is 20.00.
+  public long UnitPrice = 0;
+  /// Your own SKU or line id. Optional, and worth sending: it is what makes a refund months later traceable.
+  public string? Reference;
+  /// Tax in HUNDREDTHS OF A PERCENT — 2500 is 25%. Left at zero for a price with no tax line.
+  public long TaxRate = 0;
+  /// Klarna's line type — `discount` for money off, whose `UnitPrice` is then negative. Null for goods.
+  public string? Type;
+}
+
+/// Klarna payments. One factory in the app, then drive a purchase through it:
+///
+///   KlarnaClient Klarna() {
+///     return new KlarnaClient {
+///       Username = Secret.KlarnaUsername, Password = Secret.KlarnaPassword,
+///       BaseUrl = "https://api.playground.klarna.com",
+///       PurchaseCountry = "SE", PurchaseCurrency = "SEK", Locale = "sv-SE",
+///     };
+///   }
+///
+///   void Ship(string klarnaOrderId) { Klarna().Capture(klarnaOrderId); }
+///
+/// ⭐ ONE FACTORY, AND IT COMPILES (BL-14, 2026-09-27). The compiler notes that the credential field was assigned a
+/// secret, so the object may be returned and passed between your functions while the FIELD cannot be read back out —
+/// returned, logged, stored, copied or sent to a page. A component holding the client is refused (an object reaches the
+/// browser with its fields), and so is invoking the factory from a request.
+///
+/// ⛔ IT IS A THREE-STEP FLOW AND THE MIDDLE STEP IS NOT YOURS. You open a SESSION on the server, the shopper
+///    authorizes in their BROWSER against Klarna's widget (which hands your page an authorization token), and then you
+///    create the ORDER on the server with that token. A flow that tries to go from session straight to order has
+///    nothing to create the order with.
+///
+/// ⛔ AND THE ORDER IS NOT THE MONEY. Creating an order reserves it; `Capture` is what charges the shopper, and it is
+///    a separate call you make when you SHIP. Capturing at checkout is legal but it is not what Klarna's model
+///    assumes, and an uncaptured order eventually expires.
+public class KlarnaClient {
+  /// The API username from Klarna's merchant portal — tied to a merchant id, and to ONE environment.
+  public string Username = "";
+  public string Password = "";
+
+  /// Klarna's live API. Point it at `https://api.playground.klarna.com` while building.
+  ///
+  /// ⚠ IT DEFAULTS TO PRODUCTION, like every other kit here, and that is the safer direction: an app that shipped
+  /// still pointing at playground would take no money while looking like it worked.
+  ///
+  /// ⚠ PLAYGROUND CREDENTIALS ONLY WORK AGAINST PLAYGROUND, and live ones only against live. Pointing one at the
+  /// other is a 401 whose cause is the HOST, not the password — the failure message below says so, because nothing
+  /// else will.
+  public string BaseUrl = "https://api.klarna.com";
+
+  /// ISO 3166 alpha-2 — `SE`, `NO`, `DE`.
+  public string PurchaseCountry = "";
+  /// ISO 4217 — `SEK`, `NOK`, `EUR`.
+  public string PurchaseCurrency = "";
+  /// ⚠ THE THREE MUST AGREE. `SE` with `EUR`, or `de-DE` with `SE`, is refused — and Klarna's own message names one
+  /// field, which sends the reader to whichever of the three they happened to look at first.
+  public string Locale = "";
+
+  // ── the session ───────────────────────────────────────────────────────────────────────────────────────────────
+
+  /// Open a payment session for a basket. Answers the `ClientToken` your page hands to Klarna's widget.
+  ///
+  /// `intent` is `buy` for a one-off purchase, or `buy_and_tokenize` to ALSO keep the way the shopper pays for later
+  /// charges they are not there for — Klarna asks their consent for that, and the authorization it hands back can
+  /// make a customer token (`CreateCustomerToken`) as well as the order.
+  public KlarnaSession CreateSession(List<BasketLine> basket, string? merchantReference = null, string intent = "buy") {
+    RequireMarket();
+    if (basket.Count == 0) {
+      throw new ExternalServiceException("A Klarna session needs at least one basket line — it is what the shopper is shown and what the total is computed from.");
+    }
+
+    var lines = Lines(basket);
+    var total = 0L;
+    var tax = 0L;
+    foreach (var line in lines) { total = total + line.TotalAmount; tax = tax + line.TotalTaxAmount; }
+
+    // ⛔ COMPUTED, NEVER TAKEN FROM THE CALLER. Klarna refuses a session whose `order_amount` is not the sum of its
+    //    lines, and its message names a field rather than the sum — so the arithmetic that can be wrong is done once,
+    //    here, instead of at every call site.
+    var body = new KlarnaPurchaseRequest {
+      PurchaseCountry = PurchaseCountry, PurchaseCurrency = PurchaseCurrency, Locale = Locale,
+      OrderAmount = total, OrderTaxAmount = tax, OrderLines = lines, Intent = intent,
+      MerchantReference = merchantReference,
+    };
+
+    return JsonSerializer.Deserialize<KlarnaSession>(
+      Post("/payments/v1/sessions", JsonSerializer.Serialize(body, JsonOptions())));
+  }
+
+  /// Read a session back — what it holds now, including whether it is still open. A session lives 48 hours or until
+  /// an order is placed against it.
+  public KlarnaSession GetSession(string sessionId) {
+    return JsonSerializer.Deserialize<KlarnaSession>(Get("/payments/v1/sessions/" + Uri.EscapeDataString(sessionId)));
+  }
+
+  // ── the hosted page: Klarna's own checkout, for a shop with no checkout page of its own ─────────────────────────
+
+  /// Put a session on Klarna's Hosted Payment Page and answer where to send the shopper. With `placeOrder` (the
+  /// default) Klarna creates the order when they finish and fills `{{order_id}}` in `successUrl`. Without it
+  /// (`place_order_mode: NONE`) the page only AUTHORIZES: read the authorization token back with `GetHostedPage` and
+  /// place the order yourself — the shape a `buy_and_tokenize` session needs, because the customer token has to be
+  /// made from that authorization BEFORE an order closes the session.
+  ///
+  /// `statusUrl` is where Klarna POSTs a `KlarnaHostedPageEvent` when the session completes — give one, or an order
+  /// whose shopper closed the tab after paying is never heard of.
+  ///
+  /// ⛔ AN ORDER ID IN A RETURN ADDRESS IS A CLAIM, NOT A PAYMENT. Anybody can type one into a URL. Read it back with
+  ///    `GetOrder` and check it is YOUR order (`MerchantReference`), for the amount you expect, before you act on it.
+  public KlarnaHostedPage CreateHostedPage(string sessionId, string successUrl, string cancelUrl, string failureUrl,
+                                           bool placeOrder = true, string? statusUrl = null) {
+    if (sessionId == "") { throw new ExternalServiceException("The Hosted Payment Page runs over a payment session — open one with CreateSession first."); }
+    var body = new KlarnaHostedPageRequest {
+      PaymentSessionUrl = BaseUrl + "/payments/v1/sessions/" + Uri.EscapeDataString(sessionId),
+      MerchantUrls = new KlarnaMerchantUrls {
+        Success = successUrl, Cancel = cancelUrl, Back = cancelUrl, Failure = failureUrl, Error = failureUrl,
+        StatusUpdate = statusUrl,
+      },
+      // Said explicitly both ways: sending no options leaves the mode to Klarna's default.
+      Options = new KlarnaHostedPageOptions { PlaceOrderMode = placeOrder ? "PLACE_ORDER" : "NONE" },
+    };
+    return JsonSerializer.Deserialize<KlarnaHostedPage>(Post("/hpp/v1/sessions", JsonSerializer.Serialize(body, JsonOptions())));
+  }
+
+  /// Read a Hosted Payment Page session back — its status and, for a page over a payment session, the shopper's
+  /// `AuthorizationToken` once they have authorized.
+  public KlarnaHostedPageSession GetHostedPage(string hostedSessionId) {
+    return JsonSerializer.Deserialize<KlarnaHostedPageSession>(Get("/hpp/v1/sessions/" + Uri.EscapeDataString(hostedSessionId)));
+  }
+
+  /// Read an order back from Klarna's order management — its state, its amount and whose it is.
+  public KlarnaOrderDetails GetOrder(string orderId) {
+    return JsonSerializer.Deserialize<KlarnaOrderDetails>(Get("/ordermanagement/v1/orders/" + Uri.EscapeDataString(orderId)));
+  }
+
+  // ── the order ─────────────────────────────────────────────────────────────────────────────────────────────────
+
+  /// Turn an authorization the shopper gave in their browser into an order.
+  ///
+  /// ⚠ THE BASKET IS SENT AGAIN, and it must still add up the same way. Klarna compares it with what the shopper
+  /// authorized, so a basket that changed between the session and this call is refused — which is the protection
+  /// working, not a bug to route around.
+  public KlarnaOrder CreateOrder(string authorizationToken, List<BasketLine> basket) {
+    RequireMarket();
+    if (authorizationToken == "") {
+      throw new ExternalServiceException("A Klarna order needs the authorization token the shopper's browser received from Klarna's widget. There is no way to create one from a session id alone: the middle step of this flow happens in the browser.");
+    }
+
+    var lines = Lines(basket);
+    var total = 0L;
+    var tax = 0L;
+    foreach (var line in lines) { total = total + line.TotalAmount; tax = tax + line.TotalTaxAmount; }
+
+    // No `intent` here: it belongs to opening the session, and sending it again is refused.
+    var body = new KlarnaPurchaseRequest {
+      PurchaseCountry = PurchaseCountry, PurchaseCurrency = PurchaseCurrency, Locale = Locale,
+      OrderAmount = total, OrderTaxAmount = tax, OrderLines = lines,
+    };
+
+    return JsonSerializer.Deserialize<KlarnaOrder>(Post(
+      "/payments/v1/authorizations/" + Uri.EscapeDataString(authorizationToken) + "/order",
+      JsonSerializer.Serialize(body, JsonOptions())));
+  }
+
+  /// Place the order for an authorization with exactly what the session held — its own lines, amounts and reference,
+  /// read back with `GetSession` — for a flow whose server no longer has the basket (the Hosted Payment Page with
+  /// `placeOrder: false`). Klarna compares the order with what the shopper authorized, so the session's own copy is
+  /// the one body that cannot disagree with it.
+  public KlarnaOrder PlaceSessionOrder(string authorizationToken, KlarnaSession session) {
+    var body = new KlarnaPurchaseRequest {
+      PurchaseCountry = session.PurchaseCountry ?? "", PurchaseCurrency = session.PurchaseCurrency ?? "", Locale = session.Locale ?? "",
+      OrderAmount = session.OrderAmount, OrderTaxAmount = session.OrderTaxAmount, OrderLines = session.OrderLines,
+      MerchantReference = session.MerchantReference,
+    };
+    return JsonSerializer.Deserialize<KlarnaOrder>(Post(
+      "/payments/v1/authorizations/" + Uri.EscapeDataString(authorizationToken) + "/order",
+      JsonSerializer.Serialize(body, JsonOptions())));
+  }
+
+  // ── a kept way to pay: the customer token ─────────────────────────────────────────────────────────────────────
+  //
+  // Paths, fields and statuses from Klarna's Payments, Hosted Payment Page and Customer Token OpenAPI descriptions AS
+  // REPUBLISHED BY A THIRD PARTY (api-evangelist) — Klarna's own reference renders with JavaScript and could not be
+  // read. None of it has yet been tried against a live Klarna account.
+
+  /// Keep the way the shopper paid, from the authorization of a `buy_and_tokenize` session. Answers the customer
+  /// token `ChargeToken` charges later.
+  ///
+  /// ⛔ MAKE IT BEFORE THE ORDER. Placing an order closes the session the authorization belongs to, so the token comes
+  ///    first and the order second, both from the same authorization token.
+  public KlarnaCustomerToken CreateCustomerToken(string authorizationToken, string description) {
+    RequireMarket();
+    var body = new KlarnaCustomerTokenRequest {
+      PurchaseCountry = PurchaseCountry, PurchaseCurrency = PurchaseCurrency, Locale = Locale,
+      Description = description == "" ? "Saved for later payments" : description, IntendedUse = "SUBSCRIPTION",
+    };
+    return JsonSerializer.Deserialize<KlarnaCustomerToken>(Post(
+      "/payments/v1/authorizations/" + Uri.EscapeDataString(authorizationToken) + "/customer-token",
+      JsonSerializer.Serialize(body, JsonOptions())));
+  }
+
+  /// Read a customer token back — whether it is still active, and what the shopper pays with (a card's brand and
+  /// masked number, a direct debit's masked account).
+  public KlarnaCustomerTokenDetails GetCustomerToken(string customerToken) {
+    return JsonSerializer.Deserialize<KlarnaCustomerTokenDetails>(Get("/customer-token/v1/tokens/" + Uri.EscapeDataString(customerToken)));
+  }
+
+  /// Charge a customer token with the shopper not there — a renewal. `idempotencyKey` makes a retried charge ONE
+  /// order (`Klarna-Idempotency-Key`). `autoCapture` takes the money at once, since nothing ships to capture on.
+  ///
+  /// ⭐ A REFUSAL IS AN ANSWER HERE, NOT AN EXCEPTION. Klarna says no to a token order with a 4xx — 400 a field it
+  /// refused, 403 not allowed, 404 no such token, 409 a mismatch — and a caller renewing a subscription needs the
+  /// reason in hand rather than a stack trace. So every non-2xx comes back in `KlarnaTokenCharge`, with its status
+  /// and Klarna's error, and nothing here throws for one.
+  public KlarnaTokenCharge ChargeToken(string customerToken, List<BasketLine> basket, string? merchantReference = null,
+                                       string? idempotencyKey = null, bool autoCapture = true) {
+    if (PurchaseCurrency == "") {
+      throw new ExternalServiceException("A Klarna token order needs a `PurchaseCurrency` (\"SEK\") — the currency the token is charged in.");
+    }
+    var lines = Lines(basket);
+    var total = 0L;
+    var tax = 0L;
+    foreach (var line in lines) { total = total + line.TotalAmount; tax = tax + line.TotalTaxAmount; }
+    var body = new KlarnaTokenOrderRequest {
+      PurchaseCurrency = PurchaseCurrency, OrderAmount = total, OrderTaxAmount = tax, OrderLines = lines,
+      MerchantReference = merchantReference, AutoCapture = autoCapture,
+    };
+    var headers = Headers();
+    if (idempotencyKey != null && idempotencyKey != "") { headers.Add("Klarna-Idempotency-Key", idempotencyKey); }
+    var path = "/customer-token/v1/tokens/" + Uri.EscapeDataString(customerToken) + "/order";
+    var r = Http.Post(BaseUrl + path, JsonSerializer.Serialize(body, JsonOptions()), "application/json", headers);
+    if (r.IsSuccess) {
+      return new KlarnaTokenCharge { StatusCode = r.StatusCode, Order = JsonSerializer.Deserialize<KlarnaOrder>(r.Body) };
+    }
+    var charge = new KlarnaTokenCharge { StatusCode = r.StatusCode, Failure = Failure(path, r) };
+    if (r.Body.TrimStart().StartsWith("{")) { charge.Error = JsonSerializer.Deserialize<KlarnaError>(r.Body); }
+    return charge;
+  }
+
+  /// Stop keeping a way to pay — the shopper removed it. Klarna accepts the change and applies it (202).
+  public void CancelCustomerToken(string customerToken) {
+    var path = "/customer-token/v1/tokens/" + Uri.EscapeDataString(customerToken) + "/status";
+    var r = Http.Patch(BaseUrl + path, JsonSerializer.Serialize(new KlarnaTokenStatusRequest { Status = "CANCELLED" }, JsonOptions()),
+                       "application/json", Headers());
+    if (!r.IsSuccess) { throw new ExternalServiceException(Failure(path, r)); }
+  }
+
+  // ── after the order: the money ────────────────────────────────────────────────────────────────────────────────
+
+  /// Charge the shopper — what you call when you SHIP, not when they check out.
+  ///
+  /// `amountMinor` of 0 captures the whole order, which is the common case. A partial capture is for a partial
+  /// shipment, and Klarna allows several against one order.
+  public KlarnaCapture Capture(string orderId, long amountMinor = 0, string? description = null) {
+    var path = "/ordermanagement/v1/orders/" + Uri.EscapeDataString(orderId) + "/captures";
+    // ⚠ AN ABSENT AMOUNT IS THE ONLY WAY TO SAY "ALL OF IT". `captured_amount: 0` captures NOTHING and answers
+    //   success — the shopper unbilled, the order still open, and nothing anywhere saying so — which is why the
+    //   request field is nullable and the serializer drops it.
+    var body = new KlarnaCaptureRequest { Description = description };
+    if (amountMinor > 0) { body.CapturedAmount = amountMinor; }
+    return JsonSerializer.Deserialize<KlarnaCapture>(Post(path, JsonSerializer.Serialize(body, JsonOptions())));
+  }
+
+  /// Give money back. `amountMinor` of 0 refunds everything captured.
+  ///
+  /// ⚠ A REFUND IS AGAINST A CAPTURE, NOT AGAINST THE ORDER'S FACE VALUE — you cannot refund more than you charged,
+  /// and an order that was never captured is CANCELLED rather than refunded. Klarna's refusal here names an amount;
+  /// this note names the distinction.
+  public void Refund(string orderId, long amountMinor = 0, string? description = null) {
+    var body = new KlarnaRefundRequest { Description = description };
+    if (amountMinor > 0) { body.RefundedAmount = amountMinor; }
+    Post("/ordermanagement/v1/orders/" + Uri.EscapeDataString(orderId) + "/refunds",
+         JsonSerializer.Serialize(body, JsonOptions()));
+  }
+
+  /// Release an order that will never ship. The right verb for an uncaptured order — see `Refund`.
+  public void Cancel(string orderId) {
+    Post("/ordermanagement/v1/orders/" + Uri.EscapeDataString(orderId) + "/cancel", "");
+  }
+
+  // ── the wire ──────────────────────────────────────────────────────────────────────────────────────────────────
+
+  /// Basket lines with their arithmetic done. The one place `total_amount` and `total_tax_amount` are computed.
+  List<KlarnaOrderLine> Lines(List<BasketLine> basket) {
+    List<KlarnaOrderLine> lines = [];
+    foreach (var item in basket) {
+      if (item.Name == "") {
+        throw new ExternalServiceException("A basket line needs a `Name`: Klarna shows it to the shopper, so a line without one is a line nobody can identify on their statement.");
+      }
+      if (item.Quantity <= 0) {
+        throw new ExternalServiceException($"'{item.Name}' has a quantity of {item.Quantity}. Klarna refuses a line that is not at least one; to remove a line, leave it out of the basket.");
+      }
+      if (item.UnitPrice < 0 && item.Type != "discount") {
+        throw new ExternalServiceException($"'{item.Name}' has a negative unit price. A discount is its own line with a negative price in Klarna's model — set its `Type` to \"discount\" — not a negative price on the thing being bought.");
+      }
+
+      var total = item.UnitPrice * item.Quantity;
+      // Tax is INCLUDED in the price in Klarna's model, so the tax amount is the portion of the total rather than an
+      // addition to it: total × rate ÷ (10000 + rate). Integer arithmetic throughout — there is no rounding decision
+      // to get wrong because there is nothing to round.
+      var taxAmount = item.TaxRate > 0 ? total * item.TaxRate / (10000 + item.TaxRate) : 0;
+
+      lines.Add(new KlarnaOrderLine {
+        Type = item.Type,
+        Name = item.Name,
+        Quantity = item.Quantity,
+        UnitPrice = item.UnitPrice,
+        TotalAmount = total,
+        Reference = item.Reference,
+        TaxRate = item.TaxRate,
+        TotalTaxAmount = taxAmount,
+      });
+    }
+    return lines;
+  }
+
+  JsonSerializerOptions JsonOptions() {
+    // An absent field and an explicit `null` are different requests to Klarna, and for `captured_amount` the
+    // difference is "all of it" versus "none of it".
+    return new JsonSerializerOptions { DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull };
+  }
+
+  void RequireMarket() {
+    if (PurchaseCountry == "" || PurchaseCurrency == "" || Locale == "") {
+      throw new ExternalServiceException("This Klarna client has no market: set `PurchaseCountry` (\"SE\"), `PurchaseCurrency` (\"SEK\") and `Locale` (\"sv-SE\"). All three are required and they must agree with each other — Klarna refuses a mismatch naming only one of them.");
+    }
+  }
+
+  Dictionary<string, string> Headers() {
+    var headers = new Dictionary<string, string>();
+    headers.Add("Authorization", "Basic " + Convert.ToBase64String(Text.ToBytes(Username + ":" + Password)));
+    return headers;
+  }
+
+  string Post(string path, string body) {
+    var r = Http.Post(BaseUrl + path, body, "application/json", Headers());
+    if (!r.IsSuccess) { throw new ExternalServiceException(Failure(path, r)); }
+    return r.Body;
+  }
+
+  /// Payouts made between two instants (Settlements API v1), each page followed.
+  public List<KlarnaPayout> Payouts(DateTime from, DateTime to) {
+    List<KlarnaPayout> all = [];
+    var offset = 0;
+    while (true) {
+      var page = JsonSerializer.Deserialize<KlarnaPayoutList>(Get("/settlements/v1/payouts?start_date="
+        + Uri.EscapeDataString(from.ToString("yyyy-MM-ddTHH:mm:ssZ")) + "&end_date=" + Uri.EscapeDataString(to.ToString("yyyy-MM-ddTHH:mm:ssZ"))
+        + "&size=500&offset=" + Convert.ToString(offset)));
+      all.AddRange(page.Payouts);
+      if (page.Payouts.Count < 500) { break; }
+      offset = offset + 500;
+    }
+    return all;
+  }
+
+  /// The transactions of one payout, by its payment reference, each page followed.
+  public List<KlarnaSettlementTransaction> PayoutTransactions(string paymentReference) {
+    List<KlarnaSettlementTransaction> all = [];
+    var offset = 0;
+    while (true) {
+      var page = JsonSerializer.Deserialize<KlarnaSettlementTransactionList>(Get("/settlements/v1/transactions?payment_reference="
+        + Uri.EscapeDataString(paymentReference) + "&size=500&offset=" + Convert.ToString(offset)));
+      all.AddRange(page.Transactions);
+      if (page.Transactions.Count < 500) { break; }
+      offset = offset + 500;
+    }
+    return all;
+  }
+
+  string Get(string path) {
+    var r = Http.Get(BaseUrl + path, Headers());
+    if (!r.IsSuccess) { throw new ExternalServiceException(Failure(path, r)); }
+    return r.Body;
+  }
+
+  /// What went wrong, with every message Klarna gave rather than the first.
+  string Failure(string path, HttpResponse r) {
+    var detail = r.Body;
+    if (r.Body != "") {
+      var error = JsonSerializer.Deserialize<KlarnaError>(r.Body);
+      if (error.ErrorCode != null || error.ErrorMessages.Count > 0) {
+        detail = (error.ErrorCode ?? "error") + ": " + string.Join("; ", error.ErrorMessages);
+        // ⚑ THE CORRELATION ID IS WHAT KLARNA'S SUPPORT ASKS FOR FIRST. Dropping it turns a five-minute conversation
+        //   into a reproduction request.
+        if (error.CorrelationId != null) { detail = detail + " (correlation id: " + error.CorrelationId + ")"; }
+      }
+    }
+    if (r.StatusCode == 401) {
+      // ⛔ THE COMMONEST SETUP MISTAKE, and a 401 alone points at the password. Credentials are per ENVIRONMENT.
+      detail = detail + " — a 401 here is usually the ENVIRONMENT rather than the password: playground credentials "
+             + "work only against api.playground.klarna.com and live ones only against api.klarna.com. This client "
+             + "is pointed at " + BaseUrl + ".";
+    }
+    return "Klarna " + path + " answered " + Convert.ToString(r.StatusCode) + ": " + detail;
+  }
+}

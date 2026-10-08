@@ -1,0 +1,21 @@
+// The producer's test project for Osysharp.Payments.Klarna.
+//
+// ⚠ IT GRANTS BOTH, and that is the model working rather than over-granting: the kit DECLARES `api.klarna.com` (its
+//    default, which every consumer must grant) and `egress consumer;` for the endpoint an app chooses. This app
+//    chooses playground, so it grants that too — and the consumer word is what stops the compiler calling it unused.
+app KlarnaKitTests {
+  model "model/**/*.osy";
+  tests "**/*.test.osy";
+
+  use Osysharp.Payments.Klarna@0 {
+    // The kit's declared default, which every consumer grants…
+    egress "api.klarna.com";
+    // …and the host THIS app actually uses. Permitted without an "unused grant" warning because the kit declares
+    // `egress consumer;` — its endpoint is the app's to choose.
+    egress "api.playground.klarna.com";
+  }
+  use Osysharp.Http;
+  // The example page (model/example/pages/pay.osy) — one button; the tests never render it.
+  use Osysharp.Ui;
+  use Osysharp.Payments@0;
+}

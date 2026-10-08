@@ -1,0 +1,30 @@
+// Osysharp.Payments.Klarna — pay later, pay now and instalments through Klarna, written in Osy#.
+//
+// ⭐ NO CERTIFICATE, AND THAT IS WORTH SAYING BESIDE `Osysharp.BankId`. Klarna authenticates a merchant with ordinary
+//    HTTP Basic over TLS, so this kit needs no `clientCert` and no `serverCa` — nothing here waits on a bank's private
+//    authority. Klarna may put BankID in front of the CONSUMER inside its own flow; that happens on Klarna's side of
+//    the redirect and is not the merchant's integration.
+//
+// ⚠ CREDENTIALS ARE PER ENVIRONMENT: playground ones work only against playground and live ones only against live, so
+//   pointing a client at the wrong host is a 401 whose cause is the HOST rather than the password. Nothing else in the
+//   stack says that, so the kit's own failure message does.
+package Osysharp.Payments.Klarna {
+  version     "0.1.0";
+  minPlatform "0.9.0";
+  summary     "Klarna payments — a session, an order, and the capture/refund half that comes after.";
+
+  model "model/*.osy";
+  use Osysharp.Http;
+  // `KlarnaPayments` is a provider under the payments contract, so an app lists Klarna beside any other way to pay.
+  use Osysharp.Payments@0;
+
+  // The host the code defaults to, which a consuming app must grant like any other declared need.
+  egress "api.klarna.com";
+
+  // ⭐ …AND THE ONE YOU CHOOSE. `api.playground.klarna.com` while you build, or a gateway of your own: `consumer`
+  //    says the endpoint is the app's to name, so granting it raises no "unused grant" warning. Same shape as
+  //    `Osysharp.Models.OpenAi`, which takes a self-hosted endpoint the same way.
+  egress consumer;
+
+  tests "tests";
+}
