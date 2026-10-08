@@ -1,0 +1,85 @@
+using Osysharp.Payments;
+
+/// A provider written in the app, as anyone can: it proves the contract is implementable outside the package.
+public class FakeCardProvider : IPaymentProvider {
+  public string Key { get; } = "fakecard";
+  public string Label { get; } = "Card";
+  public string Description { get; } = "A test card provider.";
+  public bool CapturesLater { get; } = false;
+  public bool IsManual { get; } = false;
+  public List<string> EventHeaders { get; } = [];
+  public string PaidReference = "";
+
+  public bool IsReady() { return true; }
+  public string CurrencyRefusal(string currency, string country, string sellers) { return ""; }
+  public bool SavesMethods { get; } = false;
+  public PaymentCheck ChargeSaved(string savedMethod, PaymentRequest request) {
+    return new PaymentCheck { State = PaymentState.Failed, Message = "This provider keeps no way to pay." };
+  }
+  public void ForgetMethod(string savedMethod) { }
+  public PaymentStart Start(PaymentRequest request) {
+    return new PaymentStart { RedirectUrl = request.ReturnUrl.Replace("{token}", "tok-" + request.Reference), ProviderRef = "p-" + request.Reference };
+  }
+  public PaymentCheck Check(string reference, long amount, string token) {
+    return reference == PaidReference && token == "tok-" + reference
+      ? new PaymentCheck { State = PaymentState.Paid, ProviderRef = "p-" + reference }
+      : new PaymentCheck { State = PaymentState.NotPaid, Message = "Not paid." };
+  }
+  public void Capture(string providerRef, long amount) { }
+  public PaymentRefund Refund(string providerRef, long amount, string reason, string idempotencyKey) {
+    return new PaymentRefund { State = RefundState.Succeeded, RefundRef = "r-" + providerRef };
+  }
+  public void Cancel(string providerRef) { }
+  public List<Payout> Payouts(DateTime from, DateTime to) { return []; }
+
+  public List<PaymentEvent> HandleEvent(string body, Dictionary<string, string> headers) {
+    return [new PaymentEvent { Kind = PaymentEventKind.Paid, Reference = body, State = PaymentState.Paid }];
+  }
+}
+
+/// What an app does with a list of providers: offer the ready ones, start with the one chosen by its key.
+public string StartWith(List<IPaymentProvider> providers, string key, PaymentRequest request) {
+  var provider = providers.First(p => p.Key == key && p.IsReady());
+  var start = provider.Start(request);
+  return start.RedirectUrl != "" ? start.RedirectUrl : (start.Instructions ?? "");
+}
+
+/// A card reader at a shop's counter, written in the app: the customer taps their card on it, and the counter asks it
+/// how the payment stands until it is paid. A sale taken on it is refunded through the online card provider.
+public class FakeCardReader : ICounterPayment {
+  public string Key { get; } = "card-reader";
+  public string Label { get; } = "Card on the reader";
+  public string RefundsThrough { get; } = "fakecard";
+  /// The payments the customer has tapped for, by the reader's reference.
+  public List<string> Tapped = [];
+
+  public bool IsReady() { return true; }
+  public string CounterCurrencyRefusal(string currency) {
+    return currency == "EUR" ? "" : "The reader takes euros only, and this is priced in " + currency + ".";
+  }
+  public CounterPaymentStart StartAtCounter(PaymentRequest request) {
+    return new CounterPaymentStart { ProviderRef = "rdr-" + request.Reference, Instructions = "Tap or insert the card on the reader." };
+  }
+  public PaymentCheck CheckAtCounter(string reference, long amount, string providerRef) {
+    if (providerRef != "rdr-" + reference) { return new PaymentCheck { State = PaymentState.Failed, Message = "That is not this sale." }; }
+    return Tapped.Contains(providerRef)
+      ? new PaymentCheck { State = PaymentState.Paid, ProviderRef = providerRef }
+      : new PaymentCheck { State = PaymentState.Pending, Message = "Waiting for the card." };
+  }
+  public void CancelAtCounter(string providerRef) { Tapped.Remove(providerRef); }
+}
+
+/// What a counter does with its ways to take money in person: start with the one the cashier chose, if it takes the
+/// sale's currency — answers what the counter shows, or why it cannot.
+public string StartAtTheCounter(List<ICounterPayment> counter, string key, PaymentRequest request) {
+  var way = counter.First(c => c.Key == key && c.IsReady());
+  var refusal = way.CounterCurrencyRefusal(request.Currency);
+  if (refusal != "") { return refusal; }
+  return way.StartAtCounter(request).Instructions;
+}
+
+/// Give back a sale taken at the counter — through the online provider it names, like any other refund.
+public PaymentRefund RefundCounterSale(ICounterPayment way, List<IPaymentProvider> online, string providerRef, long amount) {
+  var provider = online.First(p => p.Key == way.RefundsThrough);
+  return provider.Refund(providerRef, amount, "Returned at the counter", "counter-" + providerRef);
+}

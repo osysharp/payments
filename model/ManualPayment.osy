@@ -1,0 +1,59 @@
+namespace Osysharp.Payments;
+
+/// A payment with no provider behind it: a bank transfer, cash on collection, an invoice paid later. Nothing is sent
+/// anywhere; the customer is told how to pay, and staff mark the payment as received by hand.
+public class ManualPayment : IPaymentProvider {
+  public string Key { get; set; } = "banktransfer";
+  public string Label { get; set; } = "Bank transfer";
+  public string Description { get; set; } = "Pay by transfer; the order is held while it arrives.";
+  public bool CapturesLater { get; } = false;
+  public bool IsManual { get; } = true;
+  public List<string> EventHeaders { get; } = [];
+  /// What the customer is told after ordering — the account to pay to, where to collect.
+  public string Instructions = "";
+
+  public bool IsReady() { return true; }
+  /// The currencies the account it pays into takes — ISO 4217. Empty: the seller's own currency only, since a transfer
+  /// or a till in another currency is money the account cannot receive (the shop's bank details are in its own).
+  public List<string> Currencies = [];
+
+  /// Money by hand is taken in the currencies its account takes — the seller's own unless `Currencies` names others.
+  public string CurrencyRefusal(string currency, string country, string sellers) {
+    var code = currency.Trim().ToUpper();
+    if (Currencies.Count == 0) {
+      return code == sellers.Trim().ToUpper() ? "" : $"{Label} is paid into the shop's own account, in {sellers}; it names no account for {code}.";
+    }
+    return Currencies.Any(c => c.Trim().ToUpper() == code) ? "" : $"{Label} is paid in {string.Join(", ", Currencies)}, not {code}.";
+  }
+
+  public bool SavesMethods { get; } = false;
+  public PaymentCheck ChargeSaved(string savedMethod, PaymentRequest request) {
+    return new PaymentCheck { State = PaymentState.Failed, Message = "A payment by hand cannot be charged without the customer." };
+  }
+  public void ForgetMethod(string savedMethod) { }
+
+  public PaymentStart Start(PaymentRequest request) {
+    return new PaymentStart { Instructions = Instructions == "" ? null : Instructions };
+  }
+
+  /// Nobody but staff can say a manual payment arrived.
+  public PaymentCheck Check(string reference, long amount, string token) {
+    return new PaymentCheck { State = PaymentState.NotPaid, Message = "We will confirm your payment when it arrives." };
+  }
+
+  public void Capture(string providerRef, long amount) { }
+
+  /// Money paid by hand goes back by hand; recording it is the whole step.
+  public PaymentRefund Refund(string providerRef, long amount, string reason, string idempotencyKey) {
+    return new PaymentRefund { State = RefundState.Succeeded, RefundRef = "manual-" + idempotencyKey };
+  }
+
+  public void Cancel(string providerRef) { }
+
+  /// Money paid by hand reaches the bank directly — nothing is paid out.
+  public List<Payout> Payouts(DateTime from, DateTime to) { return []; }
+
+  public List<PaymentEvent> HandleEvent(string body, Dictionary<string, string> headers) {
+    throw new ExternalServiceException("A manual payment has no events to receive.");
+  }
+}

@@ -1,0 +1,55 @@
+using Osysharp.Payments;
+
+PaymentRequest Order(string reference) {
+  return new PaymentRequest { Reference = reference, Currency = "EUR", Amount = 12900,
+                              ReturnUrl = "https://shop.test/paid/" + reference + "/{token}" };
+}
+
+[Test]
+void a_provider_the_package_never_heard_of_is_chosen_by_its_key_and_started() {
+  List<IPaymentProvider> providers = [
+    new ManualPayment { Key = "banktransfer", Label = "Bank transfer", Instructions = "Pay to IBAN SE00 0000" },
+    new FakeCardProvider(),
+  ];
+  Assert.Equal("https://shop.test/paid/A-1/tok-A-1", StartWith(providers, "fakecard", Order("A-1")));
+  Assert.Equal("Pay to IBAN SE00 0000", StartWith(providers, "banktransfer", Order("A-2")));
+}
+
+[Test]
+void a_check_answers_paid_only_for_the_reference_it_was_asked_about() {
+  var card = new FakeCardProvider { PaidReference = "A-1" };
+  Assert.Equal(PaymentState.Paid, card.Check("A-1", 12900, "tok-A-1").State);
+  Assert.Equal(PaymentState.NotPaid, card.Check("A-2", 12900, "tok-A-1").State);
+}
+
+[Test]
+void a_manual_payment_is_never_paid_until_staff_say_so_and_refunds_by_hand() {
+  var transfer = new ManualPayment { Key = "banktransfer", Instructions = "Pay to IBAN SE00 0000" };
+  Assert.True(transfer.IsManual);
+  Assert.Equal("", transfer.Start(Order("A-3")).RedirectUrl);
+  Assert.Equal(PaymentState.NotPaid, transfer.Check("A-3", 12900, "anything").State);
+  var refund = transfer.Refund("", 12900, "Returned", "order-1");
+  Assert.Equal(RefundState.Succeeded, refund.State);
+  Assert.Equal("manual-order-1", refund.RefundRef);
+  Assert.Throws<ExternalServiceException>(() => transfer.HandleEvent("{}", new Dictionary<string, string>()));
+}
+
+/// A card reader the app wrote is offered at the counter by its key: it says what to do, it answers "waiting" until the
+/// customer taps — and only for its own sale — and a counter sale is refunded through the online provider it names.
+[Test]
+void a_counter_payment_waits_for_the_tap_and_is_refunded_through_its_online_provider() {
+  var reader = new FakeCardReader();
+  List<ICounterPayment> counter = [reader];
+  Assert.Equal("Tap or insert the card on the reader.", StartAtTheCounter(counter, "card-reader", Order("C-1")));
+  Assert.Equal("The reader takes euros only, and this is priced in SEK.",
+    StartAtTheCounter(counter, "card-reader", new PaymentRequest { Reference = "C-2", Currency = "SEK", Amount = 4900 }));
+
+  Assert.Equal(PaymentState.Pending, reader.CheckAtCounter("C-1", 12900, "rdr-C-1").State);
+  reader.Tapped.Add("rdr-C-1");
+  Assert.Equal(PaymentState.Paid, reader.CheckAtCounter("C-1", 12900, "rdr-C-1").State);
+  Assert.Equal(PaymentState.Failed, reader.CheckAtCounter("C-9", 12900, "rdr-C-1").State);
+
+  var refund = RefundCounterSale(reader, [new FakeCardProvider()], "rdr-C-1", 12900);
+  Assert.Equal(RefundState.Succeeded, refund.State);
+  Assert.Equal("r-rdr-C-1", refund.RefundRef);
+}

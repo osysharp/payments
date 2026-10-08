@@ -1,0 +1,251 @@
+namespace Osysharp.Payments;
+
+// ── what the app asks for ────────────────────────────────────────────────────────────────────────────────────────
+
+/// One line of what is being paid for — the provider shows it to the customer, and some (Klarna) require it.
+/// One line of what is paid for. A line with a NEGATIVE `UnitPrice` is a discount — a code, points — and the lines
+/// together always add up to the request's `Amount`; each provider shows a discount its own way.
+public class PaymentLine {
+  public string Name = "";
+  public long Quantity = 1;
+  /// Minor units, tax included — 12900 is 129.00.
+  public long UnitPrice = 0;
+  /// Basis points — 2500 is 25 %. Zero when the seller states no tax.
+  public long TaxRate = 0;
+  public string? Reference;
+}
+
+/// A payment the app wants taken.
+public class PaymentRequest {
+  /// The app's OWN reference for what is being paid — an order number. Every answer about this payment is checked
+  /// against it: a provider's confirmation for another reference is not a confirmation for this one.
+  public string Reference = "";
+  /// ISO 4217 — "EUR", "SEK", "USD".
+  public string Currency = "";
+  /// Minor units, the whole amount — it equals the lines' total.
+  public long Amount = 0;
+  public List<PaymentLine> Lines = [];
+  public string? CustomerEmail;
+  /// The customer's mobile number, international without the plus — "46701234567" — for a provider that sends the
+  /// request to the payer's phone (Swish e-commerce). Null, and such a provider hands the customer a QR code or a link
+  /// to its app instead.
+  public string? CustomerPhone;
+  /// What the provider's page says this is — "Rust & Chrome — order RC-1041".
+  public string Description = "";
+  /// ISO 3166 alpha-2 and a locale, for providers that sell per market ("SE", "sv-SE").
+  public string? Country;
+  public string? Locale;
+  /// Where the customer comes back after paying. Contains `{token}`, which the provider replaces with its own
+  /// placeholder for the value `Check` needs — a session id, an order id.
+  public string ReturnUrl = "";
+  /// Where the customer comes back after giving up.
+  public string CancelUrl = "";
+  /// Where the provider may post events about this payment, for providers that are told a URL per payment.
+  public string EventsUrl = "";
+  /// A key that makes a retried start ONE payment, not two — the app's own id for the thing being paid.
+  public string IdempotencyKey = "";
+  /// Keep the way the customer pays, for later charges they are not there for — a subscription's renewals. The
+  /// provider's page says so to the customer. A provider that cannot (`SavesMethods` false) ignores it.
+  public bool SaveMethod = false;
+}
+
+// ── what the provider answers ────────────────────────────────────────────────────────────────────────────────────
+
+/// How a payment continues once started.
+public class PaymentStart {
+  /// Send the customer here. Empty for a payment that needs nothing more from them now (a bank transfer).
+  public string RedirectUrl = "";
+  /// The provider's own id for the payment, when it has one already.
+  public string? ProviderRef;
+  /// What to tell the customer when there is no page to send them to — "Transfer 1 290 kr to …".
+  public string? Instructions;
+}
+
+public enum PaymentState {
+  [Label("Not paid")] NotPaid,
+  /// The money is promised and will be taken on `Capture` — Klarna's state between checkout and shipping.
+  [Label("Authorised")] Authorized,
+  [Label("Paid")] Paid,
+  /// The provider has not decided yet (a fraud check, a bank still processing).
+  [Label("Pending")] Pending,
+  [Label("Failed")] Failed,
+}
+
+/// What the provider says about a payment — asked of the PROVIDER, never read off a return address.
+public class PaymentCheck {
+  public PaymentState State = PaymentState.NotPaid;
+  /// The provider's id for the payment, which `Capture`, `Refund` and `Cancel` take.
+  public string ProviderRef = "";
+  /// A sentence for the customer when the payment has not gone through.
+  public string Message = "";
+  /// The way to pay the provider kept, when the request asked (`SaveMethod`) — what `ChargeSaved` takes. The
+  /// provider's own reference, meaningless without the app's credentials; still, keep it where only the shop reads it.
+  public string SavedMethod = "";
+  /// What the customer calls it — "Visa •••• 4242".
+  public string SavedMethodLabel = "";
+}
+
+public enum RefundState {
+  [Label("Pending")] Pending,
+  [Label("Refunded")] Succeeded,
+  [Label("Failed")] Failed,
+}
+
+public class PaymentRefund {
+  public RefundState State = RefundState.Pending;
+  /// The provider's id for the refund, when it has one — events about it name it.
+  public string RefundRef = "";
+}
+
+public enum PaymentEventKind {
+  /// The payment identified by `Reference` is paid (or authorised, for a provider that captures later).
+  Paid,
+  /// A refund changed state.
+  Refund,
+  /// Something the app need not act on; recorded, ignored.
+  Other,
+}
+
+/// A provider's webhook, read into the one shape every provider answers in.
+public class PaymentEvent {
+  public PaymentEventKind Kind = PaymentEventKind.Other;
+  public string Reference = "";
+  public string ProviderRef = "";
+  public PaymentState State = PaymentState.NotPaid;
+  public string RefundRef = "";
+  public RefundState RefundState = RefundState.Pending;
+  /// Minor units, when the event carries an amount.
+  public long Amount = 0;
+  /// As on `PaymentCheck`: the way to pay the provider kept for this payment, when it was asked to.
+  public string SavedMethod = "";
+  public string SavedMethodLabel = "";
+}
+
+// ── the contract ─────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// A way to pay. Implement it for a provider, list an instance of it in your app, and the app offers it.
+///
+/// ⛔ A RETURN ADDRESS OR A WEBHOOK BODY IS A CLAIM. `Check` asks the provider itself, with the app's own
+///    credentials, and must answer `Paid` only for THIS reference and THIS amount.
+/// One payment a payout covers — a sale, a refund taken back, or a fee — in the provider's own terms.
+public class PayoutLine {
+  /// The provider's reference for the payment — what `PaymentStart.ProviderRef` / `PaymentCheck.ProviderRef` gave
+  /// the app, so the line finds its order. Empty for a line that is not one payment (a fee, an adjustment).
+  public string ProviderRef = "";
+  /// "sale", "refund", "fee" or "other".
+  public string Kind = "other";
+  /// Minor units, signed: a sale adds, a refund takes away.
+  public long Amount = 0;
+  /// When the provider CONVERTED the payment into the payout's currency: how many of the payout's currency one unit of
+  /// the payment's bought (Stripe's `exchange_rate`). 0 when it was not converted — the payout is in its currency.
+  public decimal SettledRate = 0;
+}
+
+/// Money the provider paid out to the shop's bank: what arrived, what it kept, and what it was for.
+public class Payout {
+  /// The provider's id for the payout — what the bank statement shows beside it.
+  public string Id = "";
+  /// When it reaches the bank.
+  public DateTime PaidAt;
+  public string Currency = "";
+  /// Minor units — what arrives in the bank.
+  public long Net = 0;
+  /// Minor units, positive — what the provider kept.
+  public long Fees = 0;
+  public List<PayoutLine> Lines = [];
+}
+
+public interface IPaymentProvider {
+  /// Stable, short, lowercase letters and digits — "stripe", "klarna", "banktransfer". It is stored with what was
+  /// paid, so it must not change once a payment has been taken with it.
+  string Key { get; }
+  /// What the customer chooses — "Card", "Klarna", "Bank transfer".
+  string Label { get; }
+  /// One line under the label.
+  string Description { get; }
+  /// True when the money is taken on `Capture` rather than at checkout — the app then captures when it ships.
+  bool CapturesLater { get; }
+  /// True for a payment with no provider behind it — a transfer or cash — which staff mark as paid by hand.
+  bool IsManual { get; }
+  /// The request headers `HandleEvent` needs — a webhook's signature header. The app's events endpoint declares them
+  /// (`Headers = [...]`), and the app hands their values in.
+  List<string> EventHeaders { get; }
+
+  /// True when it can keep a way to pay for charges the customer is not there for (`PaymentRequest.SaveMethod`).
+  bool SavesMethods { get; }
+
+  /// Whether it can be offered right now — its credentials are set, its market is configured.
+  bool IsReady();
+  /// "" when it can take money in `currency` (ISO 4217) from a buyer in `country` (ISO 3166 alpha-2, "" while the
+  /// checkout does not know it yet); otherwise a sentence saying why not, which a desk shows beside it — "Swish moves
+  /// Swedish kronor only, and this is priced in EUR." `sellers` is the seller's OWN currency — the one its books and
+  /// its bank accounts are in — for a provider bound to an account (a transfer) that takes only what the account does.
+  /// A provider that refuses is not offered at a checkout in that currency, and its `Start` refuses a request in it too.
+  string CurrencyRefusal(string currency, string country, string sellers);
+  /// Start paying. Answers where to send the customer, or instructions when there is nowhere.
+  PaymentStart Start(PaymentRequest request);
+  /// What the provider says about the payment the customer came back from; `token` is what replaced `{token}` in
+  /// the return address.
+  PaymentCheck Check(string reference, long amount, string token);
+  /// Take authorised money. Minor units; 0 is all of it.
+  void Capture(string providerRef, long amount);
+  /// Give money back. Minor units; 0 is all of it. `idempotencyKey` makes a retried refund one refund.
+  PaymentRefund Refund(string providerRef, long amount, string reason, string idempotencyKey);
+  /// Release a payment that was authorised and never captured.
+  void Cancel(string providerRef);
+  /// Read a webhook. Verifies it (a signature, or by asking the provider) and answers what it means; throws for a
+  /// request the provider did not send.
+  List<PaymentEvent> HandleEvent(string body, Dictionary<string, string> headers);
+  /// Take `request` from a way to pay kept earlier (`PaymentCheck.SavedMethod`), with the customer not there — a
+  /// renewal. Answers `Paid`, `Pending` (the bank is still deciding) or `Failed` with a sentence for the customer
+  /// (declined, expired, or the bank wants them to confirm it themselves). Never throws for a refusal.
+  PaymentCheck ChargeSaved(string savedMethod, PaymentRequest request);
+  /// Stop keeping a saved way to pay — the customer removed it.
+  void ForgetMethod(string savedMethod);
+  /// What the provider paid out between `from` and `to` (arrival dates), with the payments each covers and the fees it
+  /// kept — how the bank line explains itself. Empty for a provider that pays nothing out (a bank transfer).
+  List<Payout> Payouts(DateTime from, DateTime to);
+}
+
+// ── a payment made in person, at a shop's counter ────────────────────────────────────────────────────────────────
+
+/// What the counter shows once an in-person payment has begun: a picture the customer scans (Swish's QR code), or what
+/// the person at the counter tells them (a card reader waiting for the card).
+public class CounterPaymentStart {
+  /// The provider's id for this payment — what `CheckAtCounter`, `CancelAtCounter` and, once paid, a refund are made
+  /// against.
+  public string ProviderRef = "";
+  /// A PNG the customer scans with their own phone — null when there is nothing to scan (a card reader).
+  public byte[]? Qr = null;
+  /// One sentence for the counter — "Tap or insert the card on the reader."
+  public string Instructions = "";
+}
+
+/// A way to take money from a customer standing at a shop's counter: the payment starts on the provider's own device or
+/// app (a card reader, the customer's Swish), and the counter asks how it stands until it is paid.
+///
+/// ⚑ A PAYMENT TAKEN THIS WAY IS REFUNDED LIKE ANY OTHER: `RefundsThrough` names the ONLINE provider (in the app's
+///   `Payments`) whose `Refund` gives it back, so a counter sale and a web sale go back through one path — Swish's
+///   counter payment through Swish, a card on Stripe's reader through Stripe.
+///
+/// ⛔ AS WITH `Check`, ONLY THE PROVIDER SAYS IT IS PAID. `CheckAtCounter` asks the provider with the app's own
+///    credentials and answers `Paid` only for this reference and this amount.
+public interface ICounterPayment {
+  /// Stable and lowercase — "swish-counter", "stripe-terminal". What the counter chooses by.
+  string Key { get; }
+  /// What the counter's button says — "Swish", "Card on the reader".
+  string Label { get; }
+  /// The key of the provider in the app's `Payments` that refunds a payment taken this way — "swish", "stripe".
+  string RefundsThrough { get; }
+  /// Whether it can be offered now — its credentials and its device are set.
+  bool IsReady();
+  /// "" when it can take `currency` (ISO 4217); otherwise why not — as `IPaymentProvider.CurrencyRefusal`.
+  string CounterCurrencyRefusal(string currency);
+  /// Begin taking `request` in person. Throws a sentence for the counter when the provider refuses.
+  CounterPaymentStart StartAtCounter(PaymentRequest request);
+  /// How the payment `providerRef` stands, for `reference` and `amount` (minor units): `Paid`, `Pending` while the
+  /// customer is still paying, or `Failed` with a sentence for the counter.
+  PaymentCheck CheckAtCounter(string reference, long amount, string providerRef);
+  /// Withdraw a payment the customer has not made — the counter changed its mind. One already paid is left as it is.
+  void CancelAtCounter(string providerRef);
+}
