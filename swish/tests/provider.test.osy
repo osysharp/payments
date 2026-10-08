@@ -1,0 +1,304 @@
+using Osysharp.Http;
+using Osysharp.Payments;
+using Osysharp.Payments.Swish;
+
+// SwishPayments under the payments contract — every Swish call stubbed.
+
+// ── starting ────────────────────────────────────────────────────────────────────────────────────────────────────
+
+[Test]
+void m_commerce_puts_a_request_under_our_own_id_and_sends_the_customer_to_the_waiting_page_with_its_token() {
+  var id = SwishInstructionId("o-1#1");
+  List<string> urls = [];
+  List<string> bodies = [];
+  Http.Put.Stub((url, body, headers) => {
+    urls.Add(url); bodies.Add(body);
+    return Created("https://mss.cpc.getswish.net/swish-cpcapi/api/v2/paymentrequests/" + id, "tok123");
+  });
+  var start = Provider().Start(Order("GG-1041", 12900));
+  Assert.Equal("https://mss.cpc.getswish.net/swish-cpcapi/api/v2/paymentrequests/" + id, urls[0]);
+  Assert.Contains("\"payeePaymentReference\":\"GG-1041\"", bodies[0]);
+  Assert.Contains("\"payeeAlias\":\"1234679304\"", bodies[0]);
+  Assert.Contains("\"amount\":\"129.00\"", bodies[0]);
+  Assert.Contains("\"currency\":\"SEK\"", bodies[0]);
+  Assert.Contains("\"callbackUrl\":\"https://shop.test/payments/swish/events\"", bodies[0]);
+  Assert.Contains("\"message\":\"Grounds and Grapes, order GG 1041\"", bodies[0]);
+  Assert.DoesNotContain("payerAlias", bodies[0]);             // no payer: Swish answers a token
+  Assert.Equal("/swish/GG-1041/" + id + "/tok123", start.RedirectUrl);
+  Assert.Equal(id, start.ProviderRef);
+}
+
+[Test]
+void e_commerce_sends_the_request_to_the_payers_phone_and_the_page_waits_on_it() {
+  List<string> bodies = [];
+  Http.Put.Stub((url, body, headers) => { bodies.Add(body); return Created(url, ""); });
+  var order = Order("GG-1042", 34500);
+  order.CustomerPhone = "070-123 45 67";
+  var start = Provider().Start(order);
+  Assert.Contains("\"payerAlias\":\"46701234567\"", bodies[0]);
+  Assert.EndsWith("/phone", start.RedirectUrl);
+  Assert.Contains("Open Swish on your phone", start.Instructions ?? "");
+}
+
+[Test]
+void a_retried_start_is_the_same_request_to_swish_and_never_a_second() {
+  // E-commerce: the first answer was lost. The retry's PUT is refused RP09 — Swish has that id — and the request,
+  // read back and still waiting on the payer's phone, is waited on again. One request, one id.
+  var id = SwishInstructionId("o-1#1");
+  List<string> put = [];
+  Http.Put.Stub((url, body, headers) => { put.Add(url); return put.Count == 1 ? Created(url, "") : Refused("RP09", "The given instructionUUID is not available"); });
+  Http.Get.Stub((url, headers) => Request(id, "GG-1043", "129.00", "CREATED"));
+  var order = Order("GG-1043", 12900);
+  order.CustomerPhone = "0701234567";
+  var first = Provider().Start(order);
+  var again = Provider().Start(order);
+  Assert.Equal(first.ProviderRef, again.ProviderRef);
+  Assert.Equal(2, put.Count);
+  Assert.Equal(put[0], put[1]);                                 // the SAME id both times
+}
+
+[Test]
+void a_retried_m_commerce_start_withdraws_the_request_whose_token_was_lost_and_opens_the_next() {
+  var first = SwishInstructionId("o-1#1");
+  var second = SwishInstructionId("o-1#2");
+  List<string> patched = [];
+  Http.Put.Stub((url, body, headers) => url.EndsWith(first) ? Refused("RP09", "The given instructionUUID is not available") : Created(url, "tok456"));
+  Http.Get.Stub((url, headers) => Request(first, "GG-1044", "129.00", "CREATED"));
+  Http.Patch.Stub((url, body, headers) => { patched.Add(url + " " + body); return Request(first, "GG-1044", "129.00", "CANCELLED"); });
+  var start = Provider().Start(Order("GG-1044", 12900));
+  Assert.Contains("/api/v1/paymentrequests/" + first, patched[0]);
+  Assert.Contains("\"value\":\"cancelled\"", patched[0]);
+  Assert.Equal("/swish/GG-1044/" + second + "/tok456", start.RedirectUrl);
+}
+
+[Test]
+void a_start_that_finds_its_request_already_paid_goes_straight_back_to_the_shop() {
+  var id = SwishInstructionId("o-1#1");
+  Http.Put.Stub((url, body, headers) => Refused("RP09", "The given instructionUUID is not available"));
+  Http.Get.Stub((url, headers) => Request(id, "GG-1045", "129.00", "PAID"));
+  var start = Provider().Start(Order("GG-1045", 12900));
+  Assert.Equal("https://shop.test/paid/GG-1045/swish-" + id, start.RedirectUrl);
+}
+
+[Test]
+void swish_refusing_a_request_says_why_in_words() {
+  Http.Put.Stub((url, body, headers) => Refused("RP03", "Callback URL is missing or does not use HTTPS"));
+  var refusal = Assert.Throws<ExternalServiceException>(() => Provider().Start(Order("GG-1046", 12900)));
+  Assert.Contains("HTTPS on port 443", refusal.Message);
+}
+
+// ── kronor only ─────────────────────────────────────────────────────────────────────────────────────────────────
+
+[Test]
+void swish_will_not_offer_itself_for_a_checkout_that_is_not_in_kronor_and_says_why() {
+  Assert.Equal("", Provider().CurrencyRefusal("SEK", "SE", "SEK"));
+  Assert.Contains("Swedish kronor only", Provider().CurrencyRefusal("EUR", "SE", "SEK"));
+  Assert.Contains("EUR", Provider().CurrencyRefusal("EUR", "SE", "SEK"));
+  // …and a start in euros is refused before anything reaches Swish.
+  List<string> put = [];
+  Http.Put.Stub((url, body, headers) => { put.Add(url); return Created(url, "tok"); });
+  var euros = Order("GG-1047", 12900);
+  euros.Currency = "EUR";
+  var refusal = Assert.Throws<ExternalServiceException>(() => Provider().Start(euros));
+  Assert.Contains("Swedish kronor only", refusal.Message);
+  Assert.Empty(put);
+}
+
+[Test]
+void swish_is_ready_only_with_a_number_and_a_certificate() {
+  Assert.True(Provider().IsReady());
+  Assert.False(new SwishPayments { SwishNumber = "1234679304" }.IsReady());
+  Assert.False(new SwishPayments { CertificateSet = true }.IsReady());
+}
+
+// ── asking how it stands ────────────────────────────────────────────────────────────────────────────────────────
+
+[Test]
+void polling_asks_swish_and_answers_each_outcome() {
+  // Each answer is its own stub: a stub captures what it reads when it is registered, so the next state is a new one.
+  var id = SwishInstructionId("o-1#1");
+  Http.Get.Stub((url, headers) => Request(id, "GG-1050", "129.00", "CREATED"));
+  Assert.Equal(PaymentState.Pending, Provider().Check("GG-1050", 12900, id).State);
+  Http.Get.Stub((url, headers) => Request(id, "GG-1050", "129.00", "PAID"));
+  var paid = Provider().Check("GG-1050", 12900, id);
+  Assert.Equal(PaymentState.Paid, paid.State);
+  Assert.Equal(id, paid.ProviderRef);
+  Http.Get.Stub((url, headers) => Request(id, "GG-1050", "129.00", "DECLINED"));
+  Assert.Equal(PaymentState.Failed, Provider().Check("GG-1050", 12900, id).State);
+  Http.Get.Stub((url, headers) => Request(id, "GG-1050", "129.00", "CANCELLED"));
+  Assert.Equal(PaymentState.Failed, Provider().Check("GG-1050", 12900, id).State);
+  Http.Get.Stub((url, headers) => Request(id, "GG-1050", "129.00", "ERROR", "1234679304", "TM01"));
+  var timedOut = Provider().Check("GG-1050", 12900, id);
+  Assert.Equal(PaymentState.Failed, timedOut.State);
+  Assert.Contains("timed out", timedOut.Message);
+  Http.Get.Stub((url, headers) => Request(id, "GG-1050", "129.00", "ERROR", "1234679304", "DS24"));
+  Assert.Contains("Check your bank before paying again", Provider().Check("GG-1050", 12900, id).Message);
+}
+
+[Test]
+void a_paid_request_for_another_order_or_amount_or_shop_is_not_this_payment() {
+  var id = SwishInstructionId("o-1#1");
+  Http.Get.Stub((url, headers) => Request(id, "GG-1051", "129.00", "PAID"));
+  Assert.Equal(PaymentState.Paid, Provider().Check("GG-1051", 12900, id).State);
+  Assert.Equal(PaymentState.NotPaid, Provider().Check("GG-9999", 12900, id).State);       // another order's
+  Assert.Equal(PaymentState.NotPaid, Provider().Check("GG-1051", 99900, id).State);       // another amount
+  Http.Get.Stub((url, headers) => Request(id, "GG-1051", "129.00", "PAID", "1239999999"));
+  Assert.Equal(PaymentState.NotPaid, Provider().Check("GG-1051", 12900, id).State);       // another shop's
+  Assert.Equal(PaymentState.NotPaid, Provider().Check("GG-1051", 12900, "not-an-id").State);
+}
+
+// ── the callback ────────────────────────────────────────────────────────────────────────────────────────────────
+
+[Test]
+void a_forged_callback_saying_PAID_is_asked_about_and_settles_nothing() {
+  // ⛔ THE CALLBACK IS UNSIGNED: anyone can post this body. It names an order and says PAID; Swish, asked, says the
+  //    request is still waiting — so nothing is paid.
+  var id = SwishInstructionId("o-1#1");
+  var forged = "{\"id\":\"" + id + "\",\"payeePaymentReference\":\"GG-1052\",\"payeeAlias\":\"1234679304\",\"amount\":129.00,"
+             + "\"currency\":\"SEK\",\"status\":\"PAID\",\"paymentReference\":\"FAKE\"}";
+  List<string> asked = [];
+  Http.Get.Stub((url, headers) => { asked.Add(url); return Request(id, "GG-1052", "129.00", "CREATED"); });
+  var events = Provider().HandleEvent(forged, new Dictionary<string, string>());
+  Assert.Equal("https://mss.cpc.getswish.net/swish-cpcapi/api/v1/paymentrequests/" + id, asked[0]);
+  Assert.Equal(PaymentEventKind.Other, events[0].Kind);
+  Assert.Equal(PaymentState.Pending, events[0].State);
+}
+
+[Test]
+void a_callback_is_believed_only_as_far_as_swish_confirms_it_and_carries_swishs_figures() {
+  // The body claims another order and one öre; Swish's own record is what the event carries.
+  var id = SwishInstructionId("o-1#1");
+  var claim = "{\"id\":\"" + id + "\",\"payeePaymentReference\":\"GG-9999\",\"amount\":0.01,\"status\":\"PAID\"}";
+  Http.Get.Stub((url, headers) => Request(id, "GG-1053", "129.00", "PAID"));
+  var paid = Provider().HandleEvent(claim, new Dictionary<string, string>())[0];
+  Assert.Equal(PaymentEventKind.Paid, paid.Kind);
+  Assert.Equal("GG-1053", paid.Reference);
+  Assert.Equal(12900, paid.Amount);
+  Assert.Equal(id, paid.ProviderRef);
+}
+
+[Test]
+void a_callback_naming_a_request_swish_does_not_know_for_this_shop_is_refused() {
+  var id = SwishInstructionId("o-1#1");
+  Http.Get.Stub((url, headers) => NotFound());
+  Assert.Throws<ValidationException>(() => Provider().HandleEvent("{\"id\":\"" + id + "\",\"status\":\"PAID\"}", new Dictionary<string, string>()));
+  Http.Get.Stub((url, headers) => Request(id, "GG-1054", "129.00", "PAID", "1239999999"));
+  Assert.Throws<ValidationException>(() => Provider().HandleEvent("{\"id\":\"" + id + "\",\"status\":\"PAID\"}", new Dictionary<string, string>()));
+  Assert.Throws<ValidationException>(() => Provider().HandleEvent("{\"id\":\"../../refunds\",\"status\":\"PAID\"}", new Dictionary<string, string>()));
+}
+
+// ── refunds ─────────────────────────────────────────────────────────────────────────────────────────────────────
+
+[Test]
+void a_refund_gives_back_from_the_banks_reference_as_the_shop_and_asks_how_it_stands() {
+  var payment = SwishInstructionId("o-1#1");
+  var refund = SwishInstructionId("refund:r-1");
+  List<string> urls = [];
+  List<string> bodies = [];
+  Http.Get.Stub((url, headers) => url.Contains("/refunds/") ? RefundAnswer(refund, payment, "129.00", "DEBITED")
+                                                           : Request(payment, "GG-1060", "129.00", "PAID"));
+  Http.Put.Stub((url, body, headers) => { urls.Add(url); bodies.Add(body); return Created(url, ""); });
+  var answer = Provider().Refund(payment, 0, "Changed mind", "r-1");
+  Assert.Equal("https://mss.cpc.getswish.net/swish-cpcapi/api/v2/refunds/" + refund, urls[0]);
+  Assert.Contains("\"originalPaymentReference\":\"1E2FC19E5E5E4E18916609B7F8911C12\"", bodies[0]);   // the BANK's, not our id
+  Assert.Contains("\"payerAlias\":\"1234679304\"", bodies[0]);                                         // the shop pays it back
+  Assert.Contains("\"amount\":\"129.00\"", bodies[0]);
+  Assert.Contains("\"payerPaymentReference\":\"" + payment + "\"", bodies[0]);
+  Assert.Contains("\"callbackUrl\":\"https://shop.test/payments/swish/events\"", bodies[0]);
+  Assert.Equal(RefundState.Pending, answer.State);                                                   // DEBITED is not done
+  Assert.Equal(refund, answer.RefundRef);
+}
+
+[Test]
+void a_retried_refund_is_one_refund_and_reads_back_how_it_went() {
+  var payment = SwishInstructionId("o-1#1");
+  var refund = SwishInstructionId("refund:r-2");
+  List<string> urls = [];
+  Http.Get.Stub((url, headers) => url.Contains("/refunds/") ? RefundAnswer(refund, payment, "50.00", "PAID")
+                                                           : Request(payment, "GG-1061", "129.00", "PAID"));
+  Http.Put.Stub((url, body, headers) => { urls.Add(url); return Refused("RP09", "InstructionUUID not available"); });
+  var answer = Provider().Refund(payment, 5000, "Returned one", "r-2");
+  Assert.EndsWith("/api/v2/refunds/" + refund, urls[0]);
+  Assert.Equal(RefundState.Succeeded, answer.State);
+}
+
+[Test]
+void a_refund_of_a_payment_that_was_never_paid_is_refused() {
+  var payment = SwishInstructionId("o-1#1");
+  Http.Get.Stub((url, headers) => Request(payment, "GG-1062", "129.00", "DECLINED"));
+  var refusal = Assert.Throws<ExternalServiceException>(() => Provider().Refund(payment, 0, "", "r-3"));
+  Assert.Contains("nothing to give back", refusal.Message);
+}
+
+[Test]
+void a_refunds_callback_is_asked_about_too_and_names_the_payment_it_belongs_to() {
+  var payment = SwishInstructionId("o-1#1");
+  var refund = SwishInstructionId("refund:r-4");
+  Http.Get.Stub((url, headers) => RefundAnswer(refund, payment, "129.00", "DEBITED"));
+  var body = "{\"id\":\"" + refund + "\",\"originalPaymentReference\":\"1E2FC19E5E5E4E18916609B7F8911C12\",\"status\":\"PAID\"}";
+  var pending = Provider().HandleEvent(body, new Dictionary<string, string>())[0];
+  Assert.Equal(PaymentEventKind.Refund, pending.Kind);
+  Assert.Equal(RefundState.Pending, pending.RefundState);                 // the body said PAID; Swish says DEBITED
+  Http.Get.Stub((url, headers) => RefundAnswer(refund, payment, "129.00", "PAID"));
+  var done = Provider().HandleEvent(body, new Dictionary<string, string>())[0];
+  Assert.Equal(RefundState.Succeeded, done.RefundState);
+  Assert.Equal(payment, done.ProviderRef);
+  Assert.Equal(refund, done.RefundRef);
+}
+
+// ── asking again ────────────────────────────────────────────────────────────────────────────────────────────────
+
+[Test]
+void asking_again_copies_what_swish_holds_for_the_old_request_and_nothing_the_caller_says() {
+  // The customer let the request time out. The fresh one asks for exactly what Swish recorded — reference, amount,
+  // callback — so nothing on the page can change what is paid, or to whom.
+  var old = SwishInstructionId("o-1#1");
+  var fresh = SwishInstructionId("again:" + old + "#1");
+  List<string> bodies = [];
+  List<string> urls = [];
+  Http.Get.Stub((url, headers) => Request(old, "GG-1070", "129.00", "ERROR", "1234679304", "TM01"));
+  Http.Put.Stub((url, body, headers) => { urls.Add(url); bodies.Add(body); return Created(url, "tok789"); });
+  var start = Provider().Again(old, "https://shop.test/paid/GG-1070/swish-{token}");
+  Assert.EndsWith("/api/v2/paymentrequests/" + fresh, urls[0]);
+  Assert.Contains("\"payeePaymentReference\":\"GG-1070\"", bodies[0]);
+  Assert.Contains("\"amount\":\"129.00\"", bodies[0]);
+  Assert.Equal("/swish/GG-1070/" + fresh + "/tok789", start.RedirectUrl);
+}
+
+[Test]
+void asking_again_for_a_request_already_paid_asks_for_nothing_more() {
+  var old = SwishInstructionId("o-1#1");
+  List<string> put = [];
+  Http.Get.Stub((url, headers) => Request(old, "GG-1071", "129.00", "PAID"));
+  Http.Put.Stub((url, body, headers) => { put.Add(url); return Created(url, "tok"); });
+  var start = Provider().Again(old, "https://shop.test/paid/GG-1071/swish-{token}");
+  Assert.Equal("https://shop.test/paid/GG-1071/swish-" + old, start.RedirectUrl);
+  Assert.Empty(put);
+}
+
+// ── at a shop's counter (ICounterPayment) ───────────────────────────────────────────────────────────────────────
+
+[Test]
+void at_the_counter_the_customer_scans_swishs_code_and_only_swish_says_it_is_paid() {
+  var id = SwishInstructionId("counter-o-1#1");
+  List<string> bodies = [];
+  Http.Put.Stub((url, body, headers) => { bodies.Add(body); return Created(url, "tokCounter"); });
+  Http.Post.Stub((url, body, headers) => new HttpResponse { StatusCode = 200, Body = "", Bytes = Text.ToBytes("QR-" + (url.Contains("mpc.getswish.net") ? "SWISH" : "?")) });
+  var order = Order("GG-1081", 12900);
+  order.IdempotencyKey = "counter-o-1";
+  var start = Provider().StartAtCounter(order);
+  // Nobody's phone: the customer scans the code Swish drew for the token.
+  Assert.DoesNotContain("payerAlias", bodies[0]);
+  Assert.Equal(id, start.ProviderRef);
+  Assert.Equal("QR-SWISH", Text.FromBytes(start.Qr!));
+  Assert.Equal("swish", Provider().RefundsThrough);
+  // Waiting, then paid — and a paid request for ANOTHER sale is not this one's.
+  Http.Get.Stub((url, headers) => Request(id, "GG-1081", "129.00", "CREATED"));
+  Assert.Equal(PaymentState.Pending, Provider().CheckAtCounter("GG-1081", 12900, id).State);
+  Http.Get.Stub((url, headers) => Request(id, "GG-9999", "129.00", "PAID"));
+  Assert.Equal(PaymentState.NotPaid, Provider().CheckAtCounter("GG-1081", 12900, id).State);
+  Http.Get.Stub((url, headers) => Request(id, "GG-1081", "129.00", "PAID"));
+  Assert.Equal(PaymentState.Paid, Provider().CheckAtCounter("GG-1081", 12900, id).State);
+  // Kronor only, at the counter as at the checkout.
+  Assert.Contains("kronor only", Provider().CounterCurrencyRefusal("EUR"));
+}

@@ -1,0 +1,352 @@
+namespace Osysharp.Payments.Swish;
+
+using Osysharp.Payments;
+
+/// Swish as a way to pay — the customer approves in the Swish app on their phone, with BankID, and the money is in the
+/// shop's account in seconds — through the `Osysharp.Payments` contract. List it among your app's providers:
+///
+///     new SwishPayments { SwishNumber = "1231181189", CertificateSet = Security.IsSecretSet("SwishCert") }
+///
+/// and grant the package its hosts and its certificate: `use Osysharp.Payments.Swish@0 { egress "cpc.getswish.net";
+/// egress "mss.cpc.getswish.net"; egress "mpc.getswish.net"; clientCert "SwishCert"; }`.
+///
+/// ⭐ TWO WAYS TO START, one request shape. With `PaymentRequest.CustomerPhone` Swish sends the request to that phone
+///    (E-COMMERCE) and the customer opens Swish themselves. Without it Swish answers a TOKEN (M-COMMERCE): on the phone
+///    that holds Swish the page opens `AppLink`, and on a computer it shows `QrCode`, which the customer scans with the
+///    app. The store's page decides which to show; this class answers both.
+///
+/// ⛔ STATUS IS ASKED, NEVER TOLD. Swish's callback carries no signature — it arrives over TLS from Swish, and nothing
+///    in it proves who sent it — so `HandleEvent` reads only the id out of it and asks Swish, over the shop's own
+///    certificate, how that payment stands. What Swish ANSWERS is what the shop acts on. `Check` asks the same way,
+///    which is what the waiting page polls. See SECURITY-INVARIANT(swish-status-is-asked-not-told).
+///
+/// ⚑ THE MONEY ARRIVES AT ONCE, so `CapturesLater` is false, `Capture` does nothing, and there are no payouts to
+///   reconcile: a Swish payment lands in the shop's bank account directly, in real time.
+public class SwishPayments : IPaymentProvider, ICounterPayment {
+  public string Key { get; set; } = "swish";
+  public string Label { get; set; } = "Swish";
+  public string Description { get; set; } = "Approve it in the Swish app on your phone.";
+  public bool CapturesLater { get; } = false;
+  public bool IsManual { get; } = false;
+  /// Swish signs nothing, so there is no header to read: its callback is checked by asking Swish.
+  public List<string> EventHeaders { get; } = [];
+  /// Swish cannot take money without the customer approving it in their app, every time.
+  public bool SavesMethods { get; } = false;
+
+  /// The shop's Swish number, "1231181189" — the one its certificate was issued for. The simulator's is "1234679304".
+  public string SwishNumber = "";
+  /// True for the Merchant Swish Simulator (`mss.cpc.getswish.net`), false for Swish itself.
+  public bool Test = false;
+  /// Whether the app has the certificate (`Security.IsSecretSet("SwishCert")`). The package cannot ask — it never
+  /// sees the secret, only the identity — so the app says; without it Swish is not offered.
+  public bool CertificateSet = false;
+  /// The page on the app's own site that waits for the answer — the QR code or the Open Swish button — with
+  /// `{reference}`, `{id}` (the payment request's) and `{token}` (the M-commerce token, `phone` for a request sent to
+  /// the payer's phone) filled in. `Start` sends the customer there.
+  public string PayPage = "/swish/{reference}/{id}/{token}";
+  /// Where Swish reports on a refund when the payment it refunds has no callback of its own to reuse — "" to use the
+  /// payment's.
+  public string RefundCallbackUrl = "";
+
+  /// How many payment requests one payment may go through. Each one the customer lets time out (three minutes) or
+  /// declines spends an id; the next start makes a fresh one.
+  const int Attempts = 20;
+
+  public bool IsReady() { return SwishNumber != "" && CertificateSet; }
+
+  /// Swish is Swedish kronor and nothing else — a shop pricing in euros cannot offer it, and is told why.
+  public string CurrencyRefusal(string currency, string country, string sellers) {
+    if (currency.ToUpper() == "SEK") { return ""; }
+    return $"Swish moves Swedish kronor only, and this is priced in {(currency == "" ? "no currency" : currency)}.";
+  }
+
+  public SwishClient Client() {
+    return new SwishClient { BaseUrl = Test ? SwishClient.TestBaseUrl : SwishClient.ProductionBaseUrl, PayeeAlias = SwishNumber };
+  }
+
+  // ── starting ──────────────────────────────────────────────────────────────────────────────────────────────────
+
+  /// Ask Swish for the money: a payment request under an id derived from the request's `IdempotencyKey`, so a retried
+  /// start is the same request to Swish rather than a second one. Answers the waiting page (`PayPage`).
+  ///
+  /// ⚑ AN ID SWISH ALREADY HAS IS READ BACK, NOT RETRIED BLINDLY. The first attempt's answer may have been lost, the
+  ///   customer may have let it time out, or come back to pay again: the existing request is asked how it stands. PAID
+  ///   goes straight to the return address; one still waiting on the payer's phone (E-commerce) is waited on again;
+  ///   anything else — declined, timed out, cancelled, or an M-commerce request whose token is gone — moves on to the
+  ///   next id, withdrawing one that was still waiting so the customer never has two requests open.
+  public PaymentStart Start(PaymentRequest request) {
+    var refusal = CurrencyRefusal(request.Currency, request.Country ?? "", "SEK");
+    if (refusal != "") { throw new ExternalServiceException(refusal); }
+    var reference = SwishReference(request.Reference);
+    var phone = request.CustomerPhone == null || request.CustomerPhone!.Trim() == "" ? null : SwishPhone(request.CustomerPhone!);
+    var body = new SwishPaymentRequestBody {
+      PayeePaymentReference = reference, CallbackUrl = request.EventsUrl, PayerAlias = phone,
+      Amount = SwishAmount(request.Amount), Message = SwishMessage(request.Description),
+    };
+    var seed = request.IdempotencyKey == "" ? "payment:" + reference : request.IdempotencyKey;
+    return Open(seed, body, request.Amount, request.ReturnUrl);
+  }
+
+  /// A fresh payment request for a payment whose request `id` came to nothing — the customer let it time out, or
+  /// declined and changed their mind. It asks for exactly what Swish holds for `id` — its reference, amount, message
+  /// and callback — so nothing the caller passes can change what is paid, or to whom. Answers the waiting page.
+  public PaymentStart Again(string id, string returnUrl) {
+    var client = Client();
+    var old = client.GetPaymentRequest(id);
+    if (old == null || old.PayeeAlias != SwishNumber) { throw new ExternalServiceException("Swish has no such payment request for this shop."); }
+    // Paid already — the customer approved it just as they asked again: nothing more is asked of them.
+    if (old.Status == "PAID") { return new PaymentStart { RedirectUrl = returnUrl.Replace("{token}", id), ProviderRef = id }; }
+    // Still waiting: withdrawn first, so the customer never has two requests for one order open at once.
+    if (old.Status == "CREATED") { client.CancelPaymentRequest(id); }
+    var body = new SwishPaymentRequestBody {
+      PayeePaymentReference = old.PayeePaymentReference, CallbackUrl = old.CallbackUrl ?? "", PayerAlias = old.PayerAlias,
+      Amount = SwishAmount(SwishMinor(old.Amount)), Message = old.Message,
+    };
+    return Open("again:" + id, body, SwishMinor(old.Amount), returnUrl);
+  }
+
+  PaymentStart Open(string seed, SwishPaymentRequestBody body, long amount, string returnUrl) {
+    var opened = OpenRequest(seed, body, amount);
+    if (opened.Paid) { return new PaymentStart { RedirectUrl = returnUrl.Replace("{token}", opened.Id), ProviderRef = opened.Id }; }
+    return Waiting(body.PayeePaymentReference ?? "", opened.Id, opened.Token, returnUrl);
+  }
+
+  /// The payment request a start stands on — made, or one Swish already holds under the seed's id and still for this
+  /// reference and amount (see `Start` for why an id Swish has is read back). Shared by the web's start and the counter's.
+  SwishOpened OpenRequest(string seed, SwishPaymentRequestBody body, long amount) {
+    var client = Client();
+    var reference = body.PayeePaymentReference ?? "";
+    for (var n = 1; n <= Attempts; n = n + 1) {
+      var id = SwishInstructionId(seed + "#" + Convert.ToString(n));
+      var attempt = client.PutPaymentRequest(id, body);
+      if (attempt.Created) { return new SwishOpened { Id = id, Token = attempt.Request!.Token }; }
+      if (!attempt.IsTaken()) { throw new ExternalServiceException(Refusal(attempt.Errors)); }
+
+      // Ours already: ask how it stands.
+      var existing = client.GetPaymentRequest(id);
+      if (existing == null || existing.PayeePaymentReference != reference || SwishMinor(existing.Amount) != amount) { continue; }
+      if (existing.Status == "PAID") { return new SwishOpened { Id = id, Paid = true }; }
+      if (existing.Status == "CREATED") {
+        // Still on the payer's phone: wait for it. An M-commerce request's token was in the lost answer, so it is
+        // withdrawn and the next id takes its place.
+        if (body.PayerAlias != null) { return new SwishOpened { Id = id }; }
+        client.CancelPaymentRequest(id);
+      }
+    }
+    throw new ExternalServiceException($"Swish has been asked for this payment {Attempts} times without an answer. Write to the shop, and it will find another way.");
+  }
+
+  PaymentStart Waiting(string reference, string id, string token, string returnUrl) {
+    return new PaymentStart {
+      RedirectUrl = PayPage.Replace("{reference}", Uri.EscapeDataString(reference)).Replace("{id}", id)
+                           .Replace("{token}", token == "" ? "phone" : Uri.EscapeDataString(token)),
+      ProviderRef = id,
+      Instructions = token == "" ? "Open Swish on your phone and approve the payment." : null,
+    };
+  }
+
+  // ── asking ────────────────────────────────────────────────────────────────────────────────────────────────────
+
+  /// How the payment request `token` stands, as SWISH says — the return page and the waiting page both ask here. It
+  /// answers Paid only for a request made to THIS shop's number, for THIS reference and THIS amount in kronor.
+  public PaymentCheck Check(string reference, long amount, string token) {
+    if (!IsSwishId(token)) { return new PaymentCheck { Message = "The payment was not completed." }; }
+    // SECURITY-INVARIANT(swish-status-is-asked-not-told): what settles a Swish payment is Swish's own answer to a GET made
+    // over the shop's certificate — never an address, a page or a callback body, none of which is signed. The request
+    // must be to this shop's number, for this reference and amount, in kronor. Guarded by provider.test.osy
+    // a_forged_callback_saying_PAID_is_asked_about_and_settles_nothing and a_paid_request_for_another_order_or_amount_is_not_this_payment.
+    var pr = Client().GetPaymentRequest(token);
+    if (pr == null) { return new PaymentCheck { Message = "Swish has no record of that payment." }; }
+    if (pr.PayeeAlias != SwishNumber || pr.PayeePaymentReference != reference || SwishMinor(pr.Amount) != amount
+        || (pr.Currency ?? "") != "SEK") {
+      return new PaymentCheck { Message = "That Swish payment is not for this order." };
+    }
+    return CheckOf(pr, token);
+  }
+
+  PaymentCheck CheckOf(SwishPaymentRequest pr, string id) {
+    var status = pr.Status ?? "";
+    if (status == "PAID") { return new PaymentCheck { State = PaymentState.Paid, ProviderRef = id }; }
+    if (status == "CREATED") {
+      return new PaymentCheck { State = PaymentState.Pending, ProviderRef = id, Message = "Waiting for you to approve it in Swish." };
+    }
+    if (status == "DECLINED") { return new PaymentCheck { State = PaymentState.Failed, ProviderRef = id, Message = "The payment was declined in Swish." }; }
+    if (status == "CANCELLED") { return new PaymentCheck { State = PaymentState.Failed, ProviderRef = id, Message = "The Swish payment was cancelled." }; }
+    return new PaymentCheck { State = PaymentState.Failed, ProviderRef = id, Message = SayError(pr.ErrorCode ?? "", pr.ErrorMessage ?? "") };
+  }
+
+  /// A payment request's error, for the customer (Integration Guide §5.5.2).
+  string SayError(string code, string said) {
+    if (code == "TM01") { return "Swish timed out before the payment was approved. Nothing was taken."; }
+    if (code == "BANKIDCL") { return "The BankID signing was cancelled, so nothing was taken."; }
+    if (code == "BANKIDONGOING") { return "BankID was already busy with something else. Try again in a moment."; }
+    if (code == "BANKIDUNKN") { return "BankID could not approve the payment. Nothing was taken."; }
+    if (code == "RF07") { return "Your bank declined the payment. It may be over your Swish limit."; }
+    if (code == "ACMT03") { return "That number is not connected to Swish."; }
+    if (code == "FF10") { return "Your bank could not process the payment just now. Nothing was taken."; }
+    // ⚠ DS24 IS THE ONE THAT IS NOT A NO: Swish lost the bank's answer after the payment started, and cannot say
+    //   whether it went through. Paying again could pay twice, so the customer is told to look first.
+    if (code == "DS24") { return "Swish did not hear back from your bank, so it cannot say whether this was paid. Check your bank before paying again."; }
+    return said == "" ? "Swish could not take the payment." : "Swish could not take the payment: " + said;
+  }
+
+  /// What to say when Swish refuses to create a request — a 422's codes, the ones a caller can act on spelled out.
+  string Refusal(List<SwishError> errors) {
+    List<string> said = [];
+    foreach (var e in errors) {
+      var code = e.ErrorCode ?? "";
+      if (code == "RP03") { said.Add("RP03: Swish calls back over HTTPS on port 443 only, and this callback is not one — Swish refuses a request without it."); }
+      else if (code == "BE18") { said.Add("BE18: that is not a mobile number Swish can send a request to."); }
+      else if (code == "ACMT03") { said.Add("ACMT03: that number is not connected to Swish."); }
+      else if (code == "RP06") { said.Add("RP06: this number already has a Swish request waiting. Approve or decline that one first."); }
+      else if (code == "AM21") { said.Add("AM21: this is over the payer's Swish limit. Their bank can raise it."); }
+      else { said.Add(code + ": " + (e.ErrorMessage ?? "")); }
+    }
+    return said.Count == 0 ? "Swish refused the payment request." : "Swish refused the payment request. " + string.Join(" ", said);
+  }
+
+  // ── what the page shows ───────────────────────────────────────────────────────────────────────────────────────
+
+  /// The QR code of an M-commerce request, as PNG bytes drawn by Swish — store it and show it (see `SwishClient.QrCode`).
+  public byte[] QrCode(string token) { return Client().QrCode(token); }
+
+  /// The `swish://` link that opens the app on this device with the request loaded, returning to `returnUrl`.
+  public string AppLink(string token, string returnUrl) { return Client().AppLink(token, returnUrl); }
+
+  // ── at a shop's counter ───────────────────────────────────────────────────────────────────────────────────────
+  //
+  // The customer standing at the counter scans the QR code on the counter's screen with their own Swish app (Swish's
+  // "M-commerce" request, with no payer number) and approves it with BankID. What settles it is Swish's answer, asked
+  // over the certificate, exactly as `Check` asks — never the screen, never the clerk.
+
+  /// Refunded by Swish itself — the same provider, so a counter sale goes back the way a web sale does.
+  public string RefundsThrough { get; set; } = "swish";
+
+  public string CounterCurrencyRefusal(string currency) { return CurrencyRefusal(currency, "", "SEK"); }
+
+  /// A payment request with no payer number, and the QR code Swish draws for its token.
+  public CounterPaymentStart StartAtCounter(PaymentRequest request) {
+    var refusal = CurrencyRefusal(request.Currency, "", "SEK");
+    if (refusal != "") { throw new ExternalServiceException(refusal); }
+    var reference = SwishReference(request.Reference);
+    var body = new SwishPaymentRequestBody {
+      PayeePaymentReference = reference, CallbackUrl = request.EventsUrl, PayerAlias = null,
+      Amount = SwishAmount(request.Amount), Message = SwishMessage(request.Description),
+    };
+    var seed = request.IdempotencyKey == "" ? "counter:" + reference : request.IdempotencyKey;
+    var opened = OpenRequest(seed, body, request.Amount);
+    if (opened.Paid) { return new CounterPaymentStart { ProviderRef = opened.Id, Instructions = "Swish says it is paid." }; }
+    return new CounterPaymentStart { ProviderRef = opened.Id, Qr = QrCode(opened.Token),
+                                     Instructions = "Scan the code in the Swish app and approve it with BankID." };
+  }
+
+  public PaymentCheck CheckAtCounter(string reference, long amount, string providerRef) {
+    return Check(reference, amount, providerRef);
+  }
+
+  public void CancelAtCounter(string providerRef) { Cancel(providerRef); }
+
+  // ── after ─────────────────────────────────────────────────────────────────────────────────────────────────────
+
+  /// Nothing to take: Swish moves the money when the customer approves.
+  public void Capture(string providerRef, long amount) { }
+
+  /// Withdraw a payment request the customer has not answered. One already settled is left as it is.
+  public void Cancel(string providerRef) {
+    if (IsSwishId(providerRef)) { Client().CancelPaymentRequest(providerRef); }
+  }
+
+  /// Give money back from a PAID payment request (`providerRef`, its id). `amount` 0 is all of it. The refund's id is
+  /// derived from `idempotencyKey`, so a retried refund is one refund. Answers how Swish says it stands right after —
+  /// usually still under way; the refund's callback, asked about like a payment's, settles it.
+  public PaymentRefund Refund(string providerRef, long amount, string reason, string idempotencyKey) {
+    var client = Client();
+    var pr = IsSwishId(providerRef) ? client.GetPaymentRequest(providerRef) : null;
+    if (pr == null || pr.PayeeAlias != SwishNumber) { throw new ExternalServiceException($"Swish has no payment {providerRef} for this shop to refund."); }
+    if (pr.Status != "PAID" || (pr.PaymentReference ?? "") == "") {
+      throw new ExternalServiceException($"Swish payment {providerRef} is {(pr.Status ?? "unknown").ToLower()}, not paid, so there is nothing to give back.");
+    }
+    var minor = amount == 0 ? SwishMinor(pr.Amount) : amount;
+    var callback = (pr.CallbackUrl ?? "") != "" ? pr.CallbackUrl! : RefundCallbackUrl;
+    var body = new SwishRefundBody {
+      OriginalPaymentReference = pr.PaymentReference!, CallbackUrl = callback, Amount = SwishAmount(minor),
+      Message = SwishMessage(reason == "" ? "Refund" : reason), PayerPaymentReference = providerRef,
+    };
+    var id = SwishInstructionId("refund:" + (idempotencyKey == "" ? providerRef + ":" + Convert.ToString(minor) : idempotencyKey));
+    var attempt = client.PutRefund(id, body);
+    if (!attempt.Created && !attempt.IsTaken()) {
+      var said = string.Join(" ", attempt.Errors.Select(e => (e.ErrorCode ?? "") + ": " + (e.ErrorMessage ?? "")));
+      if (attempt.Errors.Any(e => e.ErrorCode == "RF08")) { said = "RF08: that is more than is left of the payment to give back. " + said; }
+      throw new ExternalServiceException("Swish refused the refund. " + said);
+    }
+    var refund = client.GetRefund(id);
+    // A taken id must be THIS payment's refund — a refund of something else under a colliding key settles nothing here.
+    if (refund == null || refund.PayerPaymentReference != providerRef) {
+      return new PaymentRefund { State = RefundState.Pending, RefundRef = id };
+    }
+    return new PaymentRefund { State = RefundStateOf(refund.Status ?? ""), RefundRef = id };
+  }
+
+  /// A refund's status as the contract counts it. ⚠ DEBITED is not done — the receiving bank can still refuse it, and
+  /// the money then comes back with a late ERROR — so only PAID is a refund made.
+  RefundState RefundStateOf(string status) {
+    if (status == "PAID") { return RefundState.Succeeded; }
+    if (status == "ERROR") { return RefundState.Failed; }
+    return RefundState.Pending;
+  }
+
+  /// Swish's callback for a payment request or a refund. ⛔ Unsigned — so its body is read only for the id, the
+  /// payment request or refund is read back from Swish over the shop's certificate, and the event carries what SWISH
+  /// says. An id Swish does not know for this shop is a request Swish did not send, and is refused.
+  public List<PaymentEvent> HandleEvent(string body, Dictionary<string, string> headers) {
+    var said = JsonSerializer.Deserialize<SwishCallback>(body);
+    var id = said.Id ?? "";
+    if (!IsSwishId(id)) { throw new ValidationException("That is not a Swish callback: it names no payment request or refund."); }
+    var client = Client();
+    if (said.OriginalPaymentReference != null) {
+      var refund = client.GetRefund(id);
+      if (refund == null || refund.PayerAlias != SwishNumber) { throw new ValidationException($"Swish has no refund {id} for this shop."); }
+      return [new PaymentEvent {
+        Kind = PaymentEventKind.Refund, ProviderRef = refund.PayerPaymentReference ?? "", RefundRef = id,
+        RefundState = RefundStateOf(refund.Status ?? ""), Amount = SwishMinor(refund.Amount),
+      }];
+    }
+    var pr = client.GetPaymentRequest(id);
+    if (pr == null || pr.PayeeAlias != SwishNumber) { throw new ValidationException($"Swish has no payment request {id} for this shop."); }
+    var check = CheckOf(pr, id);
+    return [new PaymentEvent {
+      Kind = check.State == PaymentState.Paid && (pr.Currency ?? "") == "SEK" ? PaymentEventKind.Paid : PaymentEventKind.Other,
+      Reference = pr.PayeePaymentReference ?? "", ProviderRef = id, State = check.State, Amount = SwishMinor(pr.Amount),
+    }];
+  }
+
+  public PaymentCheck ChargeSaved(string savedMethod, PaymentRequest request) {
+    return new PaymentCheck { State = PaymentState.Failed, Message = "Swish needs the customer to approve every payment in their app." };
+  }
+
+  public void ForgetMethod(string savedMethod) { }
+
+  /// A Swish payment reaches the shop's bank account directly and at once — there are no payouts.
+  public List<Payout> Payouts(DateTime from, DateTime to) { return []; }
+}
+
+/// A mobile number as Swish reads a payer: digits only, country code first, no leading zero — "070-123 45 67" is
+/// "46701234567". A number that cannot be one is refused here, by name, rather than by Swish as BE18.
+public string SwishPhone(string phone) {
+  var digits = Regex.Replace(phone, "[^0-9+]", "");
+  if (digits.StartsWith("+")) { digits = digits.Substring(1); }
+  else if (digits.StartsWith("00")) { digits = digits.Substring(2); }
+  else if (digits.StartsWith("0")) { digits = "46" + digits.Substring(1); }
+  if (!Regex.IsMatch(digits, "^[1-9][0-9]{7,14}$")) {
+    throw new ExternalServiceException($"'{phone}' is not a mobile number Swish can send a request to. Write it with the country code, like 46701234567 or 070 123 45 67.");
+  }
+  return digits;
+}
+
+/// A payment request a start stands on: its id, and the M-commerce token Swish answered ("" when there is none — a
+/// request on the payer's phone, or one already paid).
+class SwishOpened {
+  public string Id = "";
+  public string Token = "";
+  public bool Paid = false;
+}

@@ -1,0 +1,237 @@
+namespace Osysharp.Payments.Swish;
+
+using Osysharp.Http;
+
+/// What one attempt to create a payment request or a refund answered — created, or refused with Swish's own codes.
+///
+/// ⭐ A REFUSAL IS DATA HERE, NOT AN EXCEPTION, because one of them is not a failure at all: `RP09` ("the given
+///    instructionUUID is not available") is what a RETRIED create answers, and the caller must read the request back
+///    rather than give up. Everything else a caller needs a sentence for is in `Errors`.
+public class SwishAttempt {
+  public bool Created = false;
+  public int StatusCode = 0;
+  public SwishCreated? Request;
+  public List<SwishError> Errors = [];
+
+  /// True when Swish refused this instruction id because it has one by that id already — the retry case.
+  public bool IsTaken() { return Errors.Any(e => e.ErrorCode == "RP09"); }
+}
+
+/// The Swish Commerce API — payment requests, refunds and the QR code of a payment request — over MUTUAL TLS.
+///
+///   SwishClient Swish() {
+///     return new SwishClient { BaseUrl = SwishClient.TestBaseUrl, PayeeAlias = "1234679304" };
+///   }
+///
+/// ⛔ THE CERTIFICATE IS NOT A SETTING HERE. Swish authenticates the merchant by the TLS client certificate its bank
+///    issued (Integration Guide §2), and there is no API key at all. The app grants `clientCert "SwishCert"` in its
+///    `use` body, the platform presents that identity on this package's calls, and this code never sees a byte of it —
+///    nothing you can write in this class could leak it. The same seam as `Osysharp.BankId`.
+///
+/// ⚑ NO SERVER PIN IS NEEDED: `cpc.getswish.net` and `mss.cpc.getswish.net` both serve a DigiCert
+///   chain (GeoTrust TLS RSA CA G1 under DigiCert Global Root G2), which every public trust store holds — unlike
+///   BankID's private root. The "Swish TLS Root CA.pem" in Swish's examples is that public root.
+///
+/// ⚠ `BaseUrl` DEFAULTS TO PRODUCTION, like every kit here. Point it at `SwishClient.TestBaseUrl` — the Merchant Swish
+///   Simulator, whose test certificate Swish publishes openly — while you build.
+public class SwishClient {
+  /// Swish in production.
+  public const string ProductionBaseUrl = "https://cpc.getswish.net/swish-cpcapi";
+  /// The Merchant Swish Simulator (MSS): real validation, simulated outcomes (Integration Guide §5.3.1).
+  public const string TestBaseUrl = "https://mss.cpc.getswish.net/swish-cpcapi";
+  /// Swish's QR generator. Public — it draws a code from a token and needs no certificate.
+  public const string QrUrl = "https://mpc.getswish.net/qrg-swish/api/v1/commerce";
+
+  public string BaseUrl = "https://cpc.getswish.net/swish-cpcapi";
+  /// The shop's Swish number, "1231181189" — what the certificate was issued for. Swish refuses (403) a request for a
+  /// number other than the certificate's.
+  public string PayeeAlias = "";
+
+  // ── payment requests ──────────────────────────────────────────────────────────────────────────────────────────
+
+  /// Create a payment request under an id WE choose (`PUT /api/v2/paymentrequests/{instructionUUID}`). Swish takes an id
+  /// once, so a second PUT with the same one — a retry after a lost answer — is refused `RP09` rather than making a
+  /// second request for the customer's money: that is what makes the create idempotent, and the caller reads the
+  /// existing request back (`GetPaymentRequest`) to learn how it stands.
+  public SwishAttempt PutPaymentRequest(string instructionId, SwishPaymentRequestBody body) {
+    RequireId(instructionId);
+    body.PayeeAlias = PayeeAlias;
+    var path = "/api/v2/paymentrequests/" + instructionId;
+    var r = Http.Put(BaseUrl + path, JsonSerializer.Serialize(body, JsonOptions()), "application/json", new Dictionary<string, string>());
+    if (r.StatusCode == 201 || r.StatusCode == 200) {
+      return new SwishAttempt { Created = true, StatusCode = r.StatusCode, Request = new SwishCreated {
+        Id = instructionId, Token = HeaderOf(r, "PaymentRequestToken"), Location = HeaderOf(r, "Location") } };
+    }
+    if (r.StatusCode == 422) { return new SwishAttempt { StatusCode = 422, Errors = ErrorsOf(r) }; }
+    throw new ExternalServiceException(Failure(path, r));
+  }
+
+  /// Read a payment request back — how it stands NOW, as Swish says. `null` when Swish has no request by that id for
+  /// this merchant (404).
+  public SwishPaymentRequest? GetPaymentRequest(string id) {
+    RequireId(id);
+    var path = "/api/v1/paymentrequests/" + id;
+    var r = Http.Get(BaseUrl + path, new Dictionary<string, string>());
+    if (r.StatusCode == 404) { return null; }
+    if (!r.IsSuccess) { throw new ExternalServiceException(Failure(path, r)); }
+    return JsonSerializer.Deserialize<SwishPaymentRequest>(r.Body);
+  }
+
+  /// Withdraw a payment request nobody has answered yet. Swish allows it only while it is `CREATED`; anything else
+  /// answers `RP07`, which this treats as "already settled" and returns quietly — the request is no longer waiting
+  /// either way.
+  public void CancelPaymentRequest(string id) {
+    RequireId(id);
+    var path = "/api/v1/paymentrequests/" + id;
+    var ops = new List<SwishPatchOperation> { new SwishPatchOperation() };
+    var r = Http.Patch(BaseUrl + path, JsonSerializer.Serialize(ops), "application/json-patch+json", new Dictionary<string, string>());
+    if (r.IsSuccess) { return; }
+    if (r.StatusCode == 422 && ErrorsOf(r).Any(e => e.ErrorCode == "RP07")) { return; }
+    throw new ExternalServiceException(Failure(path, r));
+  }
+
+  // ── refunds ───────────────────────────────────────────────────────────────────────────────────────────────────
+
+  /// Create a refund under an id we choose (`PUT /api/v2/refunds/{instructionUUID}`) — idempotent the same way.
+  public SwishAttempt PutRefund(string instructionId, SwishRefundBody body) {
+    RequireId(instructionId);
+    body.PayerAlias = PayeeAlias;
+    var path = "/api/v2/refunds/" + instructionId;
+    var r = Http.Put(BaseUrl + path, JsonSerializer.Serialize(body, JsonOptions()), "application/json", new Dictionary<string, string>());
+    if (r.StatusCode == 201 || r.StatusCode == 200) {
+      return new SwishAttempt { Created = true, StatusCode = r.StatusCode,
+                                Request = new SwishCreated { Id = instructionId, Location = HeaderOf(r, "Location") } };
+    }
+    if (r.StatusCode == 422) { return new SwishAttempt { StatusCode = 422, Errors = ErrorsOf(r) }; }
+    throw new ExternalServiceException(Failure(path, r));
+  }
+
+  /// Read a refund back. `null` when Swish has none by that id for this merchant.
+  public SwishRefund? GetRefund(string id) {
+    RequireId(id);
+    var path = "/api/v1/refunds/" + id;
+    var r = Http.Get(BaseUrl + path, new Dictionary<string, string>());
+    if (r.StatusCode == 404) { return null; }
+    if (!r.IsSuccess) { throw new ExternalServiceException(Failure(path, r)); }
+    return JsonSerializer.Deserialize<SwishRefund>(r.Body);
+  }
+
+  // ── the QR code ───────────────────────────────────────────────────────────────────────────────────────────────
+
+  /// The QR code of an M-commerce payment request, as PNG bytes drawn by Swish's own generator.
+  ///
+  /// ⚑ DRAWN BY SWISH, not by a library in the browser: the code the Swish app scans is Swish's own format, and Swish is
+  ///   the one party guaranteed to draw it the way its app reads it. A PNG rather than an SVG on purpose — an app that
+  ///   stores it and serves it from its own origin (`File.WriteAllBytes` + `File.SignedUrl`) serves a picture, and an
+  ///   SVG from a third party is a document that can carry script.
+  public byte[] QrCode(string token, long size = 300) {
+    if (token == "") {
+      throw new ExternalServiceException("A QR code is drawn from an M-commerce payment request's token. This request has none — it was sent to the payer's phone (E-commerce), which has nothing to scan.");
+    }
+    var body = new SwishQrRequest { Token = token, Size = size };
+    var r = Http.Post(QrUrl, JsonSerializer.Serialize(body), "application/json", new Dictionary<string, string>());
+    if (!r.IsSuccess) { throw new ExternalServiceException("Swish's QR generator answered " + Convert.ToString(r.StatusCode) + ": " + r.Body); }
+    if (r.Bytes == null) { throw new ExternalServiceException("Swish's QR generator answered with no picture."); }
+    return r.Bytes!;
+  }
+
+  /// The link that opens the Swish app on THIS device with the request loaded (Integration Guide §4.2) — for a customer
+  /// paying on the phone that holds Swish. `returnUrl` is where Swish sends them back when they are done.
+  public string AppLink(string token, string returnUrl) {
+    return "swish://paymentrequest?token=" + Uri.EscapeDataString(token) + "&callbackurl=" + Uri.EscapeDataString(returnUrl);
+  }
+
+  void RequireId(string id) {
+    if (!IsSwishId(id)) {
+      throw new ExternalServiceException($"'{id}' is not a Swish id — Swish's ids are 32 upper-case hexadecimal digits.");
+    }
+  }
+
+  // ── the wire ──────────────────────────────────────────────────────────────────────────────────────────────────
+
+  JsonSerializerOptions JsonOptions() {
+    // An absent `payerAlias` is what makes a request M-commerce; an explicit null is a malformed request.
+    return new JsonSerializerOptions { DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull };
+  }
+
+  string HeaderOf(HttpResponse r, string name) {
+    var lower = name.ToLower();
+    return r.Headers == null ? "" : r.Headers.Where(h => h.Name.ToLower() == lower).Select(h => h.Value).FirstOrDefault() ?? "";
+  }
+
+  List<SwishError> ErrorsOf(HttpResponse r) {
+    if (!r.Body.TrimStart().StartsWith("[")) { return []; }
+    return JsonSerializer.Deserialize<List<SwishError>>(r.Body);
+  }
+
+  /// What went wrong, in Swish's codes, with the ones that point somewhere other than the call spelled out.
+  string Failure(string path, HttpResponse r) {
+    var detail = r.Body;
+    if (r.StatusCode == 422) {
+      detail = string.Join("; ", ErrorsOf(r).Select(e => (e.ErrorCode ?? "") + " " + (e.ErrorMessage ?? "")));
+    }
+    if (r.StatusCode == 401) {
+      detail = detail + " — the certificate was refused: `clientCert \"SwishCert\"` must hold the certificate for THIS "
+             + "environment (the simulator's test certificate against " + TestBaseUrl + ", your bank's against production), "
+             + "with its password in `SwishCertPassword`.";
+    }
+    if (r.StatusCode == 403) {
+      detail = detail + " — the Swish number " + PayeeAlias + " is not the one the certificate was issued for.";
+    }
+    return "Swish " + path + " answered " + Convert.ToString(r.StatusCode) + ": " + detail;
+  }
+}
+
+// ── the rules Swish enforces, applied before Swish has to refuse ────────────────────────────────────────────────
+
+/// Minor units as Swish writes kronor: 12900 → "129.00". Integer arithmetic throughout — nothing to round.
+public string SwishAmount(long minor) {
+  if (minor <= 0) { throw new ExternalServiceException($"A Swish amount is at least 0.01 kr; this one is {minor} öre."); }
+  var ore = minor % 100;
+  return Convert.ToString(minor / 100) + "." + (ore < 10 ? "0" : "") + Convert.ToString(ore);
+}
+
+/// Kronor as Swish answers them (129.00) back to minor units.
+public long SwishMinor(decimal kronor) { return (long)Math.Round(kronor * 100m, MidpointRounding.AwayFromZero); }
+
+/// What the payer reads in the Swish app, made to fit: at most 50 characters of `a-ö A-Ö 0-9 :;.,?!()"` and spaces.
+/// "Grounds & Grapes — order GG-1041" becomes "Grounds and Grapes, order GG 1041". Swish refuses anything else with
+/// RP02, a code that names the field and not the character.
+public string SwishMessage(string text) {
+  var m = text.Replace("&", " and ").Replace(" — ", ", ").Replace(" – ", ", ").Replace("—", ", ").Replace("–", ", ");
+  m = Regex.Replace(m, "[-_/+*#@]", " ");
+  m = Regex.Replace(m, "[^a-zA-Z0-9åäöÅÄÖéÉüÜ :;.,?!()\"]", "");
+  m = Regex.Replace(m, " +", " ").Trim();
+  if (m.Length > 50) {
+    m = m.Substring(0, 50);
+    var cut = m.LastIndexOf(" ");
+    if (cut > 30) { m = m.Substring(0, cut); }
+    m = m.Trim();
+  }
+  return m;
+}
+
+/// A merchant reference Swish will take — 1–36 characters of `a-z A-Z 0-9 - _ . + * /` — or a refusal naming it,
+/// because a reference that had to be altered would no longer find its order.
+public string SwishReference(string reference) {
+  if (!Regex.IsMatch(reference, "^[a-zA-Z0-9\\-_.+*/]{1,36}$")) {
+    throw new ExternalServiceException($"Swish takes a payment reference of 1 to 36 letters, digits and - _ . + * /, and '{reference}' is not one. Swish would refuse it (FF08); give the order a reference that is.");
+  }
+  return reference;
+}
+
+/// A payment request's or refund's id derived from `seed` — the same seed, the same id, so a retried create is the
+/// SAME request to Swish and cannot become a second one.
+///
+/// ⚑ Swish's ids are RFC 4122 UUIDs of version 1, 3, 4 or 5, in upper case with no hyphens (Integration Guide
+///   §5.5.8). This is the first 128 bits of SHA-256 over the seed with the version (4) and variant bits set — the
+///   shape of a random UUID, whose bits here happen to be a hash's.
+public string SwishInstructionId(string seed) {
+  var h = Crypto.Sha256Hex("osysharp-swish:" + seed).ToUpper();
+  var variant = "89AB".Substring("0123456789ABCDEF".IndexOf(h.Substring(16, 1)) % 4, 1);
+  return h.Substring(0, 12) + "4" + h.Substring(13, 3) + variant + h.Substring(17, 15);
+}
+
+/// Is `id` a Swish instruction id — 32 upper-case hex digits? Every path this client builds from an id checks it
+/// first, so an id arriving from a callback or an address can never steer a request anywhere but where it names.
+public bool IsSwishId(string id) { return Regex.IsMatch(id, "^[0-9A-F]{32}$"); }

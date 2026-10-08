@@ -1,0 +1,37 @@
+// Osysharp.Payments.Swish — Swish, Sweden's phone payments, written in Osy#.
+//
+// Built from Getswish AB's "Swish Merchant Integration Guide" (v2.6) and the Commerce API reference at
+// https://developer.swish.nu — payment requests v2 (https://developer.swish.nu/api/payment-request/v2), refunds v2
+// (https://developer.swish.nu/api/refunds), the Merchant Swish Simulator (https://developer.swish.nu/api/mss) and the
+// QR generator (https://developer.swish.nu/api/qr-codes).
+//
+// ⭐ THE SECOND KIT OVER MUTUAL TLS, after `Osysharp.BankId`, and the same seam. Swish has no API key: a merchant is
+//    whoever holds the TLS client certificate its bank issued for its Swish number. `clientCert` grants the IDENTITY,
+//    not the key — the platform authenticates as it on this package's calls, and nothing in the package can read a
+//    byte of it.
+//
+// ⚑ NO `serverCa`, unlike BankID: both Swish API hosts serve a DigiCert chain every public trust store holds. The
+//   "Swish TLS Root CA.pem" in Swish's examples is that root.
+//
+// ⚠ THREE HOSTS ARE DECLARED, and an app grants all three: production, the simulator (which `Test = true` points at),
+//   and the QR generator, which is public and draws a code from a token without a certificate.
+package Osysharp.Payments.Swish {
+  version     "0.1.0";
+  minPlatform "0.9.0";
+  summary     "Swish payments — a request to the payer's phone or a QR code, status asked of Swish over mutual TLS, and refunds.";
+
+  model "model/*.osy";
+  use Osysharp.Http;
+  // `SwishPayments` is a provider under the payments contract, so an app lists Swish beside any other way to pay.
+  use Osysharp.Payments@0;
+
+  egress "cpc.getswish.net";
+  egress "mss.cpc.getswish.net";
+  egress "mpc.getswish.net";
+
+  // The merchant certificate, as a secret the app declares: `osy secret set SwishCert --file swish.p12 --base64`, and
+  // the export password as `SwishCertPassword` (the simulator's test certificate's is `swish`).
+  clientCert "SwishCert";
+
+  tests "tests";
+}

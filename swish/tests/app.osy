@@ -1,0 +1,23 @@
+// The producer's test project for Osysharp.Payments.Swish — an ordinary app that depends on the kit by name.
+//
+// ⭐ IT GRANTS THE CERTIFICATE, as any app using Swish must: the kit declares `clientCert "SwishCert"`, and an app that
+//    does not grant it does not compile. The tests stub `Http.*`, so no handshake happens here — what is proven is
+//    the requests, the answers read back, and what the kit believes. The handshake itself is the platform's, proven by
+//    `ClientCertificateEgressTests` against a real TLS listener.
+app SwishKitTests {
+  model "model/**/*.osy";
+  tests "**/*.test.osy";
+
+  use Osysharp.Payments.Swish@0 {
+    // All three hosts the kit declares, as every consumer grants them: production, the simulator this project
+    // points at, and the QR generator.
+    egress     "cpc.getswish.net";
+    egress     "mss.cpc.getswish.net";
+    egress     "mpc.getswish.net";
+    clientCert "SwishCert";
+  }
+  use Osysharp.Http;
+  use Osysharp.Payments@0;
+}
+
+app.Secrets = [ new Secret("SwishCert") ];

@@ -1,0 +1,53 @@
+namespace SwishKitTests;
+
+using Osysharp.Http;
+using Osysharp.Payments;
+using Osysharp.Payments.Swish;
+
+// Thin by design: the KIT is under test. Everything here builds a request or a Swish answer the tests stub.
+
+/// The simulator's merchant — Swish's published test number.
+SwishPayments Provider() {
+  return new SwishPayments { SwishNumber = "1234679304", Test = true, CertificateSet = true };
+}
+
+PaymentRequest Order(string reference, long amount) {
+  return new PaymentRequest {
+    Reference = reference, Currency = "SEK", Amount = amount, Description = "Grounds & Grapes — order " + reference,
+    Lines = [new PaymentLine { Name = "Kiambu AA, 250 g", UnitPrice = amount, TaxRate = 1200 }],
+    ReturnUrl = "https://shop.test/paid/" + reference + "/swish-{token}", CancelUrl = "https://shop.test/paid/" + reference + "/cancelled",
+    EventsUrl = "https://shop.test/payments/swish/events", IdempotencyKey = "o-1",
+  };
+}
+
+/// What Swish answers to a created payment request — 201, the Location, and for M-commerce the token.
+HttpResponse Created(string url, string token) {
+  List<HttpHeader> headers = [new HttpHeader { Name = "Location", Value = url }];
+  if (token != "") { headers.Add(new HttpHeader { Name = "PaymentRequestToken", Value = token }); }
+  return new HttpResponse { StatusCode = 201, Body = "", Headers = headers };
+}
+
+/// Swish refusing a create — a 422 with its list of errors.
+HttpResponse Refused(string code, string message) {
+  return new HttpResponse { StatusCode = 422, Body = "[{\"errorCode\":\"" + code + "\",\"errorMessage\":\"" + message + "\",\"additionalInformation\":null}]" };
+}
+
+/// A payment request as Swish holds it.
+HttpResponse Request(string id, string reference, string amount, string status, string payee = "1234679304", string errorCode = "") {
+  return new HttpResponse { StatusCode = 200, Body = "{\"id\":\"" + id + "\",\"payeePaymentReference\":\"" + reference + "\","
+    + "\"paymentReference\":" + (status == "PAID" ? "\"1E2FC19E5E5E4E18916609B7F8911C12\"" : "null") + ","
+    + "\"callbackUrl\":\"https://shop.test/payments/swish/events\",\"payerAlias\":\"46701234567\",\"payeeAlias\":\"" + payee + "\","
+    + "\"amount\":" + amount + ",\"currency\":\"SEK\",\"message\":\"Grounds and Grapes, order " + reference + "\",\"status\":\"" + status + "\","
+    + "\"dateCreated\":\"2026-09-28T09:00:00.000Z\",\"datePaid\":null,"
+    + "\"errorCode\":" + (errorCode == "" ? "null" : "\"" + errorCode + "\"") + ",\"errorMessage\":\"\"}" };
+}
+
+/// A refund as Swish holds it.
+HttpResponse RefundAnswer(string id, string original, string amount, string status) {
+  return new HttpResponse { StatusCode = 200, Body = "{\"id\":\"" + id + "\",\"payerPaymentReference\":\"" + original + "\","
+    + "\"originalPaymentReference\":\"1E2FC19E5E5E4E18916609B7F8911C12\",\"paymentReference\":null,"
+    + "\"callbackUrl\":\"https://shop.test/payments/swish/events\",\"payerAlias\":\"1234679304\",\"payeeAlias\":null,"
+    + "\"amount\":" + amount + ",\"currency\":\"SEK\",\"message\":\"Refund\",\"status\":\"" + status + "\",\"errorCode\":null}" };
+}
+
+HttpResponse NotFound() { return new HttpResponse { StatusCode = 404, Body = "" }; }

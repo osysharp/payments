@@ -1,0 +1,133 @@
+// The Swish Commerce API on the wire — JSON both ways, camelCase, so each field says its own external name.
+//
+// Every shape here is from Getswish AB's "Swish Merchant Integration Guide" (version 2.6, §5.5 API Objects) and the
+// Commerce API reference at https://developer.swish.nu/api/payment-request/v2 and .../api/refunds.
+namespace Osysharp.Payments.Swish;
+
+/// What `PUT /api/v2/paymentrequests/{instructionUUID}` takes (Integration Guide §5.4.2).
+///
+/// ⚠ THE AMOUNT GOES UP AS TEXT, "129.00" — Swish's own examples send it quoted, and a decimal the serializer wrote
+///   as 129.0 or 1.29E2 is the kind of refusal (PA02) that names a field and not the cause. `SwishClient` writes it
+///   from minor units, once.
+public class SwishPaymentRequestBody {
+  /// The app's own reference for what is paid — an order number. 1–36 characters of `a-z A-Z 0-9 - _ . + * /`.
+  [ExternalName("payeePaymentReference")] public string? PayeePaymentReference;
+  /// Where Swish posts the outcome. HTTPS on port 443, or Swish refuses the request (RP03).
+  [ExternalName("callbackUrl")] public string CallbackUrl = "";
+  /// The payer's mobile number, "46701234567" — present for E-COMMERCE (Swish sends the request to that phone), absent
+  /// for M-COMMERCE (Swish answers a token the customer's own device opens).
+  [ExternalName("payerAlias")] public string? PayerAlias;
+  /// The shop's Swish number — "123 xxx xx xx", written without spaces: "1231181189".
+  [ExternalName("payeeAlias")] public string PayeeAlias = "";
+  [ExternalName("amount")] public string Amount = "";
+  /// Only "SEK" — Swish moves Swedish kronor and nothing else.
+  [ExternalName("currency")] public string Currency = "SEK";
+  /// What the payer reads in the Swish app. At most 50 characters of `a-ö A-Ö 0-9 :;.,?!()"` and spaces — `SwishClient`
+  /// makes a description fit rather than letting Swish refuse it (RP02).
+  [ExternalName("message")] public string? Message;
+}
+
+/// A payment request as Swish holds it — what `GET /api/v1/paymentrequests/{id}` answers, and what its callback posts.
+public class SwishPaymentRequest {
+  /// The payment request's id: the instruction UUID this kit chose when it created it.
+  [ExternalName("id")] public string? Id;
+  [ExternalName("payeePaymentReference")] public string? PayeePaymentReference;
+  /// The BANK's reference for the payment, once it is PAID. ⚠ A refund is made against THIS, not against `Id`.
+  [ExternalName("paymentReference")] public string? PaymentReference;
+  [ExternalName("callbackUrl")] public string? CallbackUrl;
+  [ExternalName("payerAlias")] public string? PayerAlias;
+  [ExternalName("payeeAlias")] public string? PayeeAlias;
+  /// Kronor, as a number — 129.00.
+  [ExternalName("amount")] public decimal Amount = 0;
+  [ExternalName("currency")] public string? Currency;
+  [ExternalName("message")] public string? Message;
+  /// `CREATED` (waiting for the payer) · `PAID` · `DECLINED` (the payer said no) · `ERROR` (timed out, blocked, the bank
+  /// refused — see `ErrorCode`) · `CANCELLED` (the merchant or the payer withdrew it).
+  [ExternalName("status")] public string? Status;
+  [ExternalName("dateCreated")] public string? DateCreated;
+  [ExternalName("datePaid")] public string? DatePaid;
+  [ExternalName("errorCode")] public string? ErrorCode;
+  [ExternalName("errorMessage")] public string? ErrorMessage;
+  [ExternalName("additionalInformation")] public string? AdditionalInformation;
+}
+
+/// What `PUT /api/v2/refunds/{instructionUUID}` takes (Integration Guide §5.4.6).
+public class SwishRefundBody {
+  /// The BANK's reference of the payment given back — `SwishPaymentRequest.PaymentReference`, not its id.
+  [ExternalName("originalPaymentReference")] public string OriginalPaymentReference = "";
+  [ExternalName("callbackUrl")] public string CallbackUrl = "";
+  /// ⚠ THE SHOP'S Swish number. On a refund the merchant is the PAYER — the naming is Swish's, and it is the field a
+  ///   first integration fills with the customer's phone (RF03).
+  [ExternalName("payerAlias")] public string PayerAlias = "";
+  [ExternalName("amount")] public string Amount = "";
+  [ExternalName("currency")] public string Currency = "SEK";
+  [ExternalName("message")] public string? Message;
+  /// The merchant's own reference for the refund, 1–35 characters. This kit writes the ORIGINAL payment request's id
+  /// here, so a refund Swish reports on later names the payment it belongs to.
+  [ExternalName("payerPaymentReference")] public string? PayerPaymentReference;
+}
+
+/// A refund as Swish holds it — what `GET /api/v1/refunds/{id}` answers, and what its callback posts.
+public class SwishRefund {
+  [ExternalName("id")] public string? Id;
+  [ExternalName("payerPaymentReference")] public string? PayerPaymentReference;
+  [ExternalName("originalPaymentReference")] public string? OriginalPaymentReference;
+  [ExternalName("paymentReference")] public string? PaymentReference;
+  [ExternalName("callbackUrl")] public string? CallbackUrl;
+  [ExternalName("payerAlias")] public string? PayerAlias;
+  [ExternalName("payeeAlias")] public string? PayeeAlias;
+  [ExternalName("amount")] public decimal Amount = 0;
+  [ExternalName("currency")] public string? Currency;
+  [ExternalName("message")] public string? Message;
+  /// `CREATED`/`VALIDATED` (under way) · `DEBITED` (taken from the shop's account, not yet with the customer) · `PAID` ·
+  /// `ERROR`. ⚠ `DEBITED` IS NOT DONE: the receiving bank can still refuse, and the money then comes back to the shop
+  ///   with a late `ERROR` (Integration Guide §3.3.2) — so only `PAID` settles a refund here.
+  [ExternalName("status")] public string? Status;
+  [ExternalName("errorCode")] public string? ErrorCode;
+  [ExternalName("errorMessage")] public string? ErrorMessage;
+  [ExternalName("additionalInformation")] public string? AdditionalInformation;
+}
+
+/// One of the errors a 422 answers — Swish sends a LIST, so a request with two bad fields names both.
+public class SwishError {
+  [ExternalName("errorCode")] public string? ErrorCode;
+  [ExternalName("errorMessage")] public string? ErrorMessage;
+  [ExternalName("additionalInformation")] public string? AdditionalInformation;
+}
+
+/// A callback's body, read only far enough to know WHAT to ask Swish about. ⛔ Nothing else in it is believed: the
+/// callback is unsigned, so the kit reads the payment request or refund back from Swish itself and acts on that.
+public class SwishCallback {
+  [ExternalName("id")] public string? Id;
+  /// Present on a refund's callback and on nothing else — how the two are told apart.
+  [ExternalName("originalPaymentReference")] public string? OriginalPaymentReference;
+}
+
+/// `PATCH /api/v1/paymentrequests/{id}` takes a list of these: `[{ "op": "replace", "path": "/status", "value": "cancelled" }]`.
+public class SwishPatchOperation {
+  [ExternalName("op")] public string Op = "replace";
+  [ExternalName("path")] public string Path = "/status";
+  [ExternalName("value")] public string Value = "cancelled";
+}
+
+/// What the QR generator takes (`POST https://mpc.getswish.net/qrg-swish/api/v1/commerce`) — the token of an
+/// M-commerce payment request, drawn as a code the Swish app scans.
+public class SwishQrRequest {
+  [ExternalName("token")] public string Token = "";
+  /// `png`, `svg` or `jpg`.
+  [ExternalName("format")] public string Format = "png";
+  /// Pixels on a side; 300 is Swish's own smallest recommendation for a screen.
+  [ExternalName("size")] public long Size = 300;
+  [ExternalName("border")] public long Border = 0;
+  [ExternalName("transparent")] public bool Transparent = true;
+}
+
+/// What creating a payment request answered: its id (ours), and — for M-commerce — the token the customer's device
+/// opens Swish with, or a QR code is drawn from.
+public class SwishCreated {
+  public string Id = "";
+  /// Empty for E-commerce: the request went to the payer's phone, and there is nothing to open.
+  public string Token = "";
+  /// Where Swish says the request can be read back.
+  public string Location = "";
+}
