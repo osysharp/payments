@@ -4,7 +4,7 @@
 // (Stripe, Klarna, a bank, Apple Pay, your own) is a class implementing `IPaymentProvider`, shipped in its own package
 // or written in the app. The app lists the providers it offers, and adding one never touches the code that sells.
 package Osysharp.Payments {
-  version     "0.1.0";
+  version "0.1.1";
   minPlatform "0.9.0";
   summary     "the payment-provider contract — start, confirm, capture, refund, cancel and webhook events — plus manual payment.";
   model "model/*.osy";
