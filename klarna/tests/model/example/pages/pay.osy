@@ -2,7 +2,7 @@
 // leaves for Klarna's page in this tab. Nothing about money passes through the browser.
 namespace ShopExample;
 
-[Page("/pay/{reference}")]
+[Route("/pay/{reference}")]
 [AllowAnonymous]
 component Pay(string reference) {
   string problem = "";

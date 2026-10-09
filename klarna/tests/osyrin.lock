@@ -25,8 +25,8 @@
     {
       "name": "Osysharp.Payments.Klarna",
       "kind": "package",
-      "version": "0.1.0",
-      "hash": "sha256:2d6e70230af5d2126a0bd2930a7bd889c35372e18329c7da223b6fbadecaee2c",
+      "version": "0.1.1",
+      "hash": "sha256:74d9d7222fe6c7519b519af958d4fcfcd030cddff62b1a7225a092e567d2fd1d",
       "minPlatform": "0.9.0",
       "shadow": "app-forkable",
       "source": "workspace:kits/klarna",
@@ -35,8 +35,8 @@
     {
       "name": "Osysharp.Ui",
       "kind": "package",
-      "version": "2.17.1",
-      "hash": "sha256:17d6d844ed71d4d614d43a6993723da70b2d39241c31e9f9fb58250a5183263c",
+      "version": "2.18.1",
+      "hash": "sha256:5dae9b4103cc649967664228cc945c2d8b5bd9ff8d45e62bf9b67d9db079545e",
       "minPlatform": "0.9.0",
       "shadow": "app-forkable",
       "source": "workspace:Platform.Core/Dsl/OsySharp/Baseline/Capabilities/Ui"
