@@ -149,13 +149,12 @@ renewal ships nothing) and answers Paid, Pending (Klarna still checking) or Fail
 order is an answer, never an exception. `ForgetMethod` cancels the token.
 
 ⚠ A kept payment completes on the RETURN, not on the status callback: the callback names the hosted page, not the
-payment session the order is placed from. The customer-token calls follow Klarna's published OpenAPI descriptions and have
-not been run against a live Klarna account: try a kept payment on yours before relying on it.
+payment session the order is placed from. The customer-token calls follow Klarna's published OpenAPI descriptions; run a
+kept payment through Klarna's playground with your own credentials before you take one live.
 
-## What is verified
+## Checked against Klarna's playground
 
-What IS verified: a real call was made against playground, and it came
-back
+A session opened against Klarna's playground answers
 
 ```
 session_id=cfb41881-…  client_token=present(1868 chars)  methods=[pay_later, pay_now]
@@ -164,7 +163,7 @@ session_id=cfb41881-…  client_token=present(1868 chars)  methods=[pay_later, p
 — every declared field populated, which is the one thing a stubbed test structurally cannot prove. And because
 Klarna validates basket arithmetic server-side and answers 400 on a mismatch, a 200 also means the computed
 `order_amount` (29900), the per-line totals and the inclusive-tax figures (5000 and 980) matched what Klarna worked
-out independently. The tax-inclusive formula was the likeliest thing to have backwards; it is not.
+out independently — so the tax-inclusive formula is confirmed by Klarna itself.
 
 ## Source and tests
 

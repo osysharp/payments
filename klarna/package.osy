@@ -9,7 +9,7 @@
 //   pointing a client at the wrong host is a 401 whose cause is the HOST rather than the password. Nothing else in the
 //   stack says that, so the kit's own failure message does.
 package Osysharp.Payments.Klarna {
-  version     "0.1.1";
+  version "0.1.2";
   minPlatform "0.9.0";
   summary     "Klarna payments — a session, an order, and the capture/refund half that comes after.";
 

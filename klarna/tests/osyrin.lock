@@ -15,8 +15,8 @@
     {
       "name": "Osysharp.Payments",
       "kind": "package",
-      "version": "0.1.0",
-      "hash": "sha256:24c25dc952d65c184b67b1c80f75ee1825e8e4fd6d5417c5e477fa77b5d8fd87",
+      "version": "0.1.1",
+      "hash": "sha256:c0a3028c5068cdd1221c962dd07e6d7b72586b0e8568f281935532781de3a7c0",
       "minPlatform": "0.9.0",
       "shadow": "app-forkable",
       "source": "workspace:kits/payments",
@@ -25,8 +25,8 @@
     {
       "name": "Osysharp.Payments.Klarna",
       "kind": "package",
-      "version": "0.1.1",
-      "hash": "sha256:74d9d7222fe6c7519b519af958d4fcfcd030cddff62b1a7225a092e567d2fd1d",
+      "version": "0.1.2",
+      "hash": "sha256:d6a4400ed7d54321bf81ccbcdc9de50c61d19ec9445878a233e2fdaf47088fbc",
       "minPlatform": "0.9.0",
       "shadow": "app-forkable",
       "source": "workspace:kits/klarna",

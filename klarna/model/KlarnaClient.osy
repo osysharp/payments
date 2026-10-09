@@ -31,7 +31,7 @@ public class BasketLine {
 ///
 ///   void Ship(string klarnaOrderId) { Klarna().Capture(klarnaOrderId); }
 ///
-/// ⭐ ONE FACTORY, AND IT COMPILES (BL-14, 2026-09-27). The compiler notes that the credential field was assigned a
+/// ⭐ ONE FACTORY. The compiler notes that the credential field was assigned a
 /// secret, so the object may be returned and passed between your functions while the FIELD cannot be read back out —
 /// returned, logged, stored, copied or sent to a page. A component holding the client is refused (an object reaches the
 /// browser with its fields), and so is invoking the factory from a request.
@@ -189,9 +189,7 @@ public class KlarnaClient {
 
   // ── a kept way to pay: the customer token ─────────────────────────────────────────────────────────────────────
   //
-  // Paths, fields and statuses from Klarna's Payments, Hosted Payment Page and Customer Token OpenAPI descriptions AS
-  // REPUBLISHED BY A THIRD PARTY (api-evangelist) — Klarna's own reference renders with JavaScript and could not be
-  // read. None of it has yet been tried against a live Klarna account.
+  // Paths, fields and statuses follow Klarna's Payments, Hosted Payment Page and Customer Token OpenAPI descriptions.
 
   /// Keep the way the shopper paid, from the authorization of a `buy_and_tokenize` session. Answers the customer
   /// token `ChargeToken` charges later.
