@@ -14,7 +14,7 @@
 //   client, so the app names its own secret (`new StripeClient { ApiKey = Secret.Mine }`) and this package never
 //   learns which. A package that declared `secret "StripeApiKey"` would be dictating the app's secret names.
 package Osysharp.Payments.Stripe {
-  version     "0.1.0";
+  version "0.1.1";
   minPlatform "0.9.0";
   summary     "card payments through Stripe — payment intents, checkout sessions, customers, refunds, verified webhooks, and a payments-contract provider.";
 

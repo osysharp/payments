@@ -15,8 +15,8 @@
     {
       "name": "Osysharp.Payments",
       "kind": "package",
-      "version": "0.1.0",
-      "hash": "sha256:24c25dc952d65c184b67b1c80f75ee1825e8e4fd6d5417c5e477fa77b5d8fd87",
+      "version": "0.1.1",
+      "hash": "sha256:c0a3028c5068cdd1221c962dd07e6d7b72586b0e8568f281935532781de3a7c0",
       "minPlatform": "0.9.0",
       "shadow": "app-forkable",
       "source": "workspace:kits/payments",
@@ -25,12 +25,21 @@
     {
       "name": "Osysharp.Payments.Stripe",
       "kind": "package",
-      "version": "0.1.0",
-      "hash": "sha256:f35f733b85ff6192d92058a7b72a7e3660753b04a10ef46c9db5c29727448c50",
+      "version": "0.1.1",
+      "hash": "sha256:56f262ec09d67ea88b2aee327736e4d9e5272adee02b1e1ff44ee2549e2d9b0c",
       "minPlatform": "0.9.0",
       "shadow": "app-forkable",
       "source": "workspace:kits/stripe",
       "constraint": "0"
     }
-  ]
+  ],
+  "bridges": {
+    "searched": [
+      "workspace",
+      "platform"
+    ],
+    "skipped": [
+      "github: offline \u2014 the public catalog was not searched for bridges. Run \u0060osy lock\u0060 with a network to look."
+    ]
+  }
 }

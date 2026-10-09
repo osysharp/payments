@@ -191,8 +191,8 @@ void the_client_reference_goes_out_on_the_session_and_comes_back_on_it() {
 
 [Test]
 void a_physical_goods_shop_can_turn_managed_payments_off_and_an_error_carries_its_dashboard_link() {
-  // ⭐ MEASURED 2026-09-26 against a real, new Stripe sandbox: every session was refused — "the product tax code is
-  //    missing … required for Managed Payments, which is enabled by default on your account". A physical-goods shop
+  // ⭐ A new Stripe account refuses every session with "the product tax code is missing … required for Managed
+  //    Payments, which is enabled by default on your account". A physical-goods shop
   //    cannot be Managed Payments at all, so it has to say so per session.
   var posted = new List<string>();
   Http.Post.Stub((url, body) => {
