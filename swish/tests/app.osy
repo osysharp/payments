@@ -3,7 +3,7 @@
 // ⭐ IT GRANTS THE CERTIFICATE, as any app using Swish must: the kit declares `clientCert "SwishCert"`, and an app that
 //    does not grant it does not compile. The tests stub `Http.*`, so no handshake happens here — what is proven is
 //    the requests, the answers read back, and what the kit believes. The handshake itself is the platform's, proven by
-//    `ClientCertificateEgressTests` against a real TLS listener.
+//    the platform's own tests against a real TLS listener.
 app SwishKitTests {
   model "model/**/*.osy";
   tests "**/*.test.osy";

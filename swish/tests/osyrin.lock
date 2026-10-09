@@ -15,8 +15,8 @@
     {
       "name": "Osysharp.Payments",
       "kind": "package",
-      "version": "0.1.0",
-      "hash": "sha256:24c25dc952d65c184b67b1c80f75ee1825e8e4fd6d5417c5e477fa77b5d8fd87",
+      "version": "0.1.1",
+      "hash": "sha256:c0a3028c5068cdd1221c962dd07e6d7b72586b0e8568f281935532781de3a7c0",
       "minPlatform": "0.9.0",
       "shadow": "app-forkable",
       "source": "workspace:kits/payments",
@@ -25,8 +25,8 @@
     {
       "name": "Osysharp.Payments.Swish",
       "kind": "package",
-      "version": "0.1.0",
-      "hash": "sha256:d031dacd418c1bc5e565f69bfff1ce2fb9f54989c64fdc4348e799ee23df11fb",
+      "version": "0.1.1",
+      "hash": "sha256:5c2d222bb677bc71ac129125f912ebe6c5557834c1dec1373bcce3ea82260a60",
       "minPlatform": "0.9.0",
       "shadow": "app-forkable",
       "source": "workspace:kits/swish",
