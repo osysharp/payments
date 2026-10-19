@@ -2,37 +2,7 @@
   "platform": {
     "version": "0.9.0"
   },
-  "entries": [
-    {
-      "name": "Osysharp.Http",
-      "kind": "package",
-      "version": "1.0.0",
-      "hash": "sha256:4c24068aeea5ef1a155459d4cc332c85d7ee3d96049f2404e54ac860d94beb0f",
-      "minPlatform": "0.9.0",
-      "shadow": "app-forkable",
-      "source": "workspace:Platform.Core/Dsl/OsySharp/Baseline/Capabilities/Http"
-    },
-    {
-      "name": "Osysharp.Payments",
-      "kind": "package",
-      "version": "0.1.1",
-      "hash": "sha256:c0a3028c5068cdd1221c962dd07e6d7b72586b0e8568f281935532781de3a7c0",
-      "minPlatform": "0.9.0",
-      "shadow": "app-forkable",
-      "source": "workspace:kits/payments",
-      "constraint": "0"
-    },
-    {
-      "name": "Osysharp.Payments.Stripe",
-      "kind": "package",
-      "version": "0.1.1",
-      "hash": "sha256:56f262ec09d67ea88b2aee327736e4d9e5272adee02b1e1ff44ee2549e2d9b0c",
-      "minPlatform": "0.9.0",
-      "shadow": "app-forkable",
-      "source": "workspace:kits/stripe",
-      "constraint": "0"
-    }
-  ],
+  "entries": [],
   "bridges": {
     "searched": [
       "workspace",
