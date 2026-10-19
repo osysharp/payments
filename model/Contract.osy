@@ -155,6 +155,8 @@ public class Payout {
   public List<PayoutLine> Lines = [];
 }
 
+/// A payment provider: what a checkout calls to take a payment, and to confirm, capture, refund or cancel it.
+/// need: take a payment, charge a card at checkout, refund a payment, plug in a payment provider
 public interface IPaymentProvider {
   /// Stable, short, lowercase letters and digits — "stripe", "klarna", "banktransfer". It is stored with what was
   /// paid, so it must not change once a payment has been taken with it.

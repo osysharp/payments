@@ -2,18 +2,7 @@
   "platform": {
     "version": "0.9.0"
   },
-  "entries": [
-    {
-      "name": "Osysharp.Payments",
-      "kind": "package",
-      "version": "0.1.1",
-      "hash": "sha256:c0a3028c5068cdd1221c962dd07e6d7b72586b0e8568f281935532781de3a7c0",
-      "minPlatform": "0.9.0",
-      "shadow": "app-forkable",
-      "source": "workspace:kits/payments",
-      "constraint": "0"
-    }
-  ],
+  "entries": [],
   "bridges": {
     "searched": [
       "workspace",
