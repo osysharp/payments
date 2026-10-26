@@ -11,7 +11,7 @@ using Osysharp.Payments.Klarna;
   return "ok";
 }
 
-// The route the callback lives at: /api/klarna/events, open (Klarna has no account here), raw body.
+// The route the callback lives at: /api/rest/v1/klarna/events, open (Klarna has no account here), raw body.
 app.Apis = [ new RestApi("Klarna") {
   Route = "klarna", Auth = new ApiAuth { Anonymous = true },
   Endpoints = [ new Endpoint(KlarnaEvents) { Method = HttpMethod.Post, Path = "/events", Raw = true } ],

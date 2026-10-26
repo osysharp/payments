@@ -171,3 +171,97 @@ Three files in `model/`, with no C# anywhere. `tests/` is the producer's own pro
 above. It does not ship, and
 `osy publish` runs it and refuses a version that fails.
 
+## Examples
+
+Taken from this package's own tests, which compile and run on every release.
+
+```osy
+using Osysharp.Http;
+using Osysharp.Payments.Klarna;
+
+[Test]
+void a_session_posts_the_market_and_the_COMPUTED_total() {
+    var posted = new List<string>();
+    var urls = new List<string>();
+    Http.Post.Stub((url, body) => {
+        urls.Add(url);
+        posted.Add(body);
+        return new HttpResponse { StatusCode = 200, Body = "{\"session_id\":\"s-1\",\"client_token\":\"tok-1\"}" };
+    });
+
+    var session = OpenSession();
+
+    Assert.Equal("https://api.playground.klarna.com/payments/v1/sessions", urls[0]);
+    Assert.Contains("\"purchase_country\":\"SE\"", posted[0]);
+    Assert.Contains("\"purchase_currency\":\"SEK\"", posted[0]);
+    Assert.Contains("\"locale\":\"sv-SE\"", posted[0]);
+    Assert.Contains("\"intent\":\"buy\"", posted[0]);
+    // 2 × 12500 + 4900 = 29900. The caller never supplied this number.
+    Assert.Contains("\"order_amount\":29900", posted[0]);
+    Assert.Equal("tok-1", session.ClientToken);
+}
+```
+
+From [`tests/klarna.test.osy`](tests/klarna.test.osy).
+
+```osy
+using Osysharp.Http;
+using Osysharp.Payments.Klarna;
+using Osysharp.Payments;
+
+[Test]
+void starting_puts_the_session_on_klarnas_hosted_page_with_the_order_id_in_the_return_address() {
+  var urls = new List<string>();
+  var posted = new List<string>();
+  Http.Post.Stub((url, body) => {
+    urls.Add(url); posted.Add(body);
+    return new HttpResponse { StatusCode = 200, Body = "{\"session_id\":\"s-1\",\"redirect_url\":\"https://pay.playground.klarna.com/h-1\"}" };
+  });
+  var start = Provider().Start(new PaymentRequest {
+    Reference = "RC-1", Currency = "SEK", Amount = 29000, Description = "Shop — order RC-1",
+    Lines = [new PaymentLine { Name = "Lamp", UnitPrice = 29000 }],
+    ReturnUrl = "https://shop.test/paid/RC-1/klarna-{token}", CancelUrl = "https://shop.test/bag",
+    EventsUrl = "https://shop.test/payments/klarna/events",
+  });
+  Assert.Equal("https://pay.playground.klarna.com/h-1", start.RedirectUrl);
+  Assert.Equal("https://api.playground.klarna.com/payments/v1/sessions", urls[0]);
+  Assert.Contains("\"merchant_reference1\":\"RC-1\"", posted[0]);
+  Assert.Contains("klarna-{{order_id}}", posted[1]);
+  Assert.Contains("\"status_update\":\"https://shop.test/payments/klarna/events\"", posted[1]);
+}
+```
+
+From [`tests/provider.test.osy`](tests/provider.test.osy).
+
+```osy
+using Osysharp.Http;
+using Osysharp.Payments.Klarna;
+
+[Test]
+void each_LINE_total_is_computed_so_a_caller_cannot_get_it_wrong() {
+    // ⛔ THE FIELD THAT IS NOT ON `BasketLine`. Klarna requires `total_amount = unit_price × quantity`, so a field the
+    //    caller could fill in wrongly is a field the kit should not offer. This asserts the computation, not a
+    //    round-trip of something handed in.
+    var posted = new List<string>();
+    Http.Post.Stub((url, body) => { posted.Add(body); return new HttpResponse { StatusCode = 200, Body = "{\"session_id\":\"s\"}" }; });
+
+    OpenSession();
+
+    Assert.Contains("\"unit_price\":12500", posted[0]);
+    Assert.Contains("\"quantity\":2", posted[0]);
+    Assert.Contains("\"total_amount\":25000", posted[0]);
+    Assert.Contains("\"reference\":\"SKU-1\"", posted[0]);
+}
+```
+
+From [`tests/klarna.test.osy`](tests/klarna.test.osy).
+
+## Learn more
+
+- [Osysharp.Payments.Klarna in the package catalogue](https://osysharp.com/packages/#osysharp-payments-klarna)
+- [The Osy# reference](https://osysharp.com/reference/) — the language, the runtime and every kit
+- [`llms-full.txt`](https://osysharp.com/llms-full.txt) — the whole reference and specification as one Markdown file, for a coding agent
+
+## Licence
+
+MIT — see [`LICENSE`](LICENSE).

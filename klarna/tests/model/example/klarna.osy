@@ -30,7 +30,7 @@ List<BasketLine> Lines(string reference) {
   var page = Klarna().CreateHostedPage(session.SessionId ?? "",
     $"{App.BaseUrl}/paid/{reference}/{{{{order_id}}}}",
     $"{App.BaseUrl}/bag", $"{App.BaseUrl}/bag",
-    true, $"{App.BaseUrl}/api/klarna/events");
+    true, $"{App.BaseUrl}/api/rest/v1/klarna/events");
   return page.RedirectUrl ?? "";
 }
 
