@@ -60,3 +60,64 @@ Provider packages: `Osysharp.Payments.Stripe`, `Osysharp.Payments.Klarna`, `Osys
 
 To write your own provider, implement `IPaymentProvider` in your app (or in a package of your own named
 `<You>.Payments.<Provider>`) and add an instance to the list.
+
+## Examples
+
+Taken from this package's own tests, which compile and run on every release.
+
+```osy
+using Osysharp.Payments;
+
+[Test]
+void a_provider_the_package_never_heard_of_is_chosen_by_its_key_and_started() {
+  List<IPaymentProvider> providers = [
+    new ManualPayment { Key = "banktransfer", Label = "Bank transfer", Instructions = "Pay to IBAN SE00 0000" },
+    new FakeCardProvider(),
+  ];
+  Assert.Equal("https://shop.test/paid/A-1/tok-A-1", StartWith(providers, "fakecard", Order("A-1")));
+  Assert.Equal("Pay to IBAN SE00 0000", StartWith(providers, "banktransfer", Order("A-2")));
+}
+```
+
+From [`tests/payments.test.osy`](tests/payments.test.osy).
+
+```osy
+using Osysharp.Payments;
+
+[Test]
+void a_check_answers_paid_only_for_the_reference_it_was_asked_about() {
+  var card = new FakeCardProvider { PaidReference = "A-1" };
+  Assert.Equal(PaymentState.Paid, card.Check("A-1", 12900, "tok-A-1").State);
+  Assert.Equal(PaymentState.NotPaid, card.Check("A-2", 12900, "tok-A-1").State);
+}
+```
+
+From [`tests/payments.test.osy`](tests/payments.test.osy).
+
+```osy
+using Osysharp.Payments;
+
+[Test]
+void a_manual_payment_is_never_paid_until_staff_say_so_and_refunds_by_hand() {
+  var transfer = new ManualPayment { Key = "banktransfer", Instructions = "Pay to IBAN SE00 0000" };
+  Assert.True(transfer.IsManual);
+  Assert.Equal("", transfer.Start(Order("A-3")).RedirectUrl);
+  Assert.Equal(PaymentState.NotPaid, transfer.Check("A-3", 12900, "anything").State);
+  var refund = transfer.Refund("", 12900, "Returned", "order-1");
+  Assert.Equal(RefundState.Succeeded, refund.State);
+  Assert.Equal("manual-order-1", refund.RefundRef);
+  Assert.Throws<ExternalServiceException>(() => transfer.HandleEvent("{}", new Dictionary<string, string>()));
+}
+```
+
+From [`tests/payments.test.osy`](tests/payments.test.osy).
+
+## Learn more
+
+- [Osysharp.Payments in the package catalogue](https://osysharp.com/packages/#osysharp-payments)
+- [The Osy# reference](https://osysharp.com/reference/) — the language, the runtime and every kit
+- [`llms-full.txt`](https://osysharp.com/llms-full.txt) — the whole reference and specification as one Markdown file, for a coding agent
+
+## Licence
+
+MIT — see [`LICENSE`](LICENSE).
