@@ -133,3 +133,90 @@ Everything is in `model/` — four files, no C# anywhere. `tests/` is the produc
 assert what went on the wire rather than that a call returned, including the whole webhook-forgery surface. It does
 not ship, and `osy publish` runs it and refuses a version that fails.
 
+## Examples
+
+Taken from this package's own tests, which compile and run on every release.
+
+```osy
+using Osysharp.Http;
+using Osysharp.Payments.Stripe;
+
+[Test]
+void a_payment_intent_is_FORM_encoded_and_never_json() {
+  // ⛔ THE ONE THING MOST PEOPLE GET WRONG. Stripe answers JSON and will not accept it — a JSON request body comes
+  //    back as a complaint about a missing parameter, which reads like the caller forgot a field.
+  var posted = new List<string>();
+  var urls = new List<string>();
+  Http.Post.Stub((url, body) => {
+    urls.Add(url);
+    posted.Add(body);
+    return new HttpResponse { StatusCode = 200, Body = "{\"id\":\"pi_1\",\"status\":\"requires_payment_method\",\"amount\":2000,\"currency\":\"sek\",\"client_secret\":\"pi_1_secret_x\"}" };
+  });
+
+  var intent = ChargeForOrder(2000, "sek", "A-1001");
+
+  Assert.Equal("https://api.stripe.com/v1/payment_intents", urls[0]);
+  Assert.Contains("amount=2000", posted[0]);
+  Assert.Contains("currency=sek", posted[0]);
+  // Not a brace in sight: if this body were JSON it would start with one.
+  Assert.DoesNotContain("{", posted[0]);
+  Assert.Equal("pi_1", intent.IntentId);
+  Assert.Equal("pi_1_secret_x", intent.ClientSecret);
+}
+```
+
+From [`tests/payments.test.osy`](tests/payments.test.osy).
+
+```osy
+using Osysharp.Http;
+using Osysharp.Payments;
+using Osysharp.Payments.Stripe;
+
+[Test]
+void starting_opens_a_checkout_session_for_this_reference_that_returns_with_the_session_id() {
+  var posted = new List<string>();
+  Http.Post.Stub((url, body) => {
+    posted.Add(body);
+    return new HttpResponse { StatusCode = 200, Body = "{\"id\":\"cs_7\",\"url\":\"https://checkout.stripe.com/c/pay/cs_7\"}" };
+  });
+  var start = new StripePayments { ApiKey = "sk_test_x", WebhookSecret = "whsec_x" }.Start(Order("RC-1", 19000));
+  Assert.Equal("https://checkout.stripe.com/c/pay/cs_7", start.RedirectUrl);
+  Assert.Contains("client_reference_id=RC-1", posted[0]);
+  Assert.Contains("unit_amount%5D=19000", posted[0]);
+  Assert.Contains("stripe-%7BCHECKOUT_SESSION_ID%7D", posted[0]);
+}
+```
+
+From [`tests/provider.test.osy`](tests/provider.test.osy).
+
+```osy
+using Osysharp.Payments.Stripe;
+
+[Test]
+void a_correctly_signed_event_verifies_and_parses() {
+  var payload = "{\"id\":\"evt_1\",\"type\":\"checkout.session.completed\",\"created\":1700000000,\"livemode\":true,\"data\":{\"object\":{\"id\":\"cs_1\",\"object\":\"checkout.session\",\"payment_status\":\"paid\",\"amount_total\":44900,\"currency\":\"sek\",\"payment_intent\":\"pi_1\"}}}";
+  var now = NowSeconds();
+
+  var e = VerifyHook(payload, SignatureFor("whsec_test", payload, now));
+
+  Assert.Equal("checkout.session.completed", e.Type);
+  Assert.Equal("evt_1", e.EventId);
+  Assert.Equal(1700000000, e.Created);
+  Assert.True(e.Livemode);
+  Assert.Equal("paid", e.Object?.PaymentStatus);
+  Assert.Equal("pi_1", e.Object?.PaymentIntent);
+  Assert.Equal(44900, e.Object?.AmountTotal);
+}
+```
+
+From [`tests/webhook.test.osy`](tests/webhook.test.osy).
+
+## Learn more
+
+- [Osysharp.Payments.Stripe in the package catalogue](https://osysharp.com/packages/#osysharp-payments-stripe)
+- [The Osy# reference](https://osysharp.com/reference/) — the language, the runtime and every kit
+- [`llms-full.txt`](https://osysharp.com/llms-full.txt) — the whole reference and specification as one Markdown file, for a coding agent
+
+## Licence
+
+MIT — see [`LICENSE`](LICENSE).
