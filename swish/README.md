@@ -117,3 +117,84 @@ callbacks, and the kronor-only refusal. `osy publish` runs them and refuses a ve
 
 To build your own on top of it — another Nordic phone payment, or Swish payouts — fork the folder: the provider is one
 class implementing `IPaymentProvider`, and `SwishClient` is ordinary Osy# over `Http.*`.
+
+## Examples
+
+Taken from this package's own tests, which compile and run on every release.
+
+```osy
+using Osysharp.Http;
+using Osysharp.Payments;
+using Osysharp.Payments.Swish;
+
+[Test]
+void m_commerce_puts_a_request_under_our_own_id_and_sends_the_customer_to_the_waiting_page_with_its_token() {
+  var id = SwishInstructionId("o-1#1");
+  List<string> urls = [];
+  List<string> bodies = [];
+  Http.Put.Stub((url, body, headers) => {
+    urls.Add(url); bodies.Add(body);
+    return Created("https://mss.cpc.getswish.net/swish-cpcapi/api/v2/paymentrequests/" + id, "tok123");
+  });
+  var start = Provider().Start(Order("GG-1041", 12900));
+  Assert.Equal("https://mss.cpc.getswish.net/swish-cpcapi/api/v2/paymentrequests/" + id, urls[0]);
+  Assert.Contains("\"payeePaymentReference\":\"GG-1041\"", bodies[0]);
+  Assert.Contains("\"payeeAlias\":\"1234679304\"", bodies[0]);
+  Assert.Contains("\"amount\":\"129.00\"", bodies[0]);
+  Assert.Contains("\"currency\":\"SEK\"", bodies[0]);
+  Assert.Contains("\"callbackUrl\":\"https://shop.test/payments/swish/events\"", bodies[0]);
+  Assert.Contains("\"message\":\"Grounds and Grapes, order GG 1041\"", bodies[0]);
+  Assert.DoesNotContain("payerAlias", bodies[0]);             // no payer: Swish answers a token
+  Assert.Equal("/swish/GG-1041/" + id + "/tok123", start.RedirectUrl);
+  Assert.Equal(id, start.ProviderRef);
+}
+```
+
+From [`tests/provider.test.osy`](tests/provider.test.osy).
+
+```osy
+using Osysharp.Http;
+using Osysharp.Payments.Swish;
+
+[Test]
+void an_amount_goes_up_as_kronor_with_two_decimals_computed_from_ore() {
+  Assert.Equal("129.00", SwishAmount(12900));
+  Assert.Equal("0.05", SwishAmount(5));
+  Assert.Equal("1000.10", SwishAmount(100010));
+  Assert.Equal(12900, SwishMinor(129.00m));
+  var refusal = Assert.Throws<ExternalServiceException>(() => SwishAmount(0));
+  Assert.Contains("0.01", refusal.Message);
+}
+```
+
+From [`tests/swish.test.osy`](tests/swish.test.osy).
+
+```osy
+using Osysharp.Http;
+using Osysharp.Payments;
+using Osysharp.Payments.Swish;
+
+[Test]
+void e_commerce_sends_the_request_to_the_payers_phone_and_the_page_waits_on_it() {
+  List<string> bodies = [];
+  Http.Put.Stub((url, body, headers) => { bodies.Add(body); return Created(url, ""); });
+  var order = Order("GG-1042", 34500);
+  order.CustomerPhone = "070-123 45 67";
+  var start = Provider().Start(order);
+  Assert.Contains("\"payerAlias\":\"46701234567\"", bodies[0]);
+  Assert.EndsWith("/phone", start.RedirectUrl);
+  Assert.Contains("Open Swish on your phone", start.Instructions ?? "");
+}
+```
+
+From [`tests/provider.test.osy`](tests/provider.test.osy).
+
+## Learn more
+
+- [Osysharp.Payments.Swish in the package catalogue](https://osysharp.com/packages/#osysharp-payments-swish)
+- [The Osy# reference](https://osysharp.com/reference/) — the language, the runtime and every kit
+- [`llms-full.txt`](https://osysharp.com/llms-full.txt) — the whole reference and specification as one Markdown file, for a coding agent
+
+## Licence
+
+MIT — see [`LICENSE`](LICENSE).
